@@ -1,5 +1,7 @@
 # ThermalForge
 
+**ThermalForge is a local-use fork of [ProducerGuy/ThermalForge](https://github.com/ProducerGuy/ThermalForge), with a more proactive thermal policy for Apple Silicon Macs.** It keeps the smooth shape of the system curve while engaging earlier and reaching higher fan speeds sooner. The working goal is to preserve sustained thermal performance and reduce repeated hot cycles, accepting more fan noise than Apple's quieter default behavior.
+
 **Free, open-source fan control for Apple Silicon Macs.** Menu bar app + CLI.
 
 Built in 2026 with Swift. No subscriptions, no telemetry, no ads.
@@ -17,8 +19,8 @@ Tools like **Macs Fan Control** and **TG Pro** charge $15–$20 for fan control 
 
 | Feature | ThermalForge | Macs Fan Control | TG Pro |
 |---|---|---|---|
-| Smart adaptive fan curve | **Yes** | No | No |
-| Machine-specific calibration | No | No | No |
+| Adaptive fan curve | **Yes** | No | No |
+| Machine-specific calibration | **Yes (optional)** | No | No |
 | Multi-sensor safety | **Yes — all sensors** | [One sensor per fan](https://github.com/crystalidea/macs-fan-control/issues/266) | Manual rules only |
 | Proactive cooling (ramps before throttle) | **Yes** | No | No |
 | Fan curve type | Per-profile shapes (ease-in, linear, S-curve, instant) | Linear between 2 points | Manual step-function |
@@ -44,7 +46,7 @@ Tools like **Macs Fan Control** and **TG Pro** charge $15–$20 for fan control 
 ## Features
 
 - Real-time CPU, GPU, RAM, SSD, and ambient temperatures in the menu bar
-- Five fan profiles with proportional curves (not binary on/off)
+- A data-driven Default fan curve with a compact visual preview; future profiles are added through one registry
 - Thermal logging — CSV + JSON data export with process correlation for research
 - Automatic fan re-apply after sleep/wake
 - Fahrenheit / Celsius toggle
@@ -56,29 +58,21 @@ Tools like **Macs Fan Control** and **TG Pro** charge $15–$20 for fan control 
 
 ## Profiles
 
-Every profile uses a proportional curve with a per-profile curve shape — fans ramp gradually with temperature, not as binary switches. All profiles share a unified 50°C off threshold (matching Apple's observed behavior). Each profile has its own sustained trigger duration — fans only engage after temperature stays above the start threshold for a profile-specific number of seconds, filtering transient spikes that resolve on their own. Reacting to transient spikes would cause the start/stop cycling that is the #1 cause of fan bearing wear (source: [Analog Devices fan control](https://www.analog.com/en/analog-dialogue/articles/how-to-control-fan-speed.html)).
-
-The fan control loop runs at 100ms by default; the full SMC sensor snapshot runs every 1 second by default and only reads keys found during startup. Both intervals can be changed in the app under **REFRESH**. The expensive full snapshot is reused between samples to keep idle CPU and power low. Each profile has its own ramp rates and curve shape tuned to its purpose. Ramp governor design sourced from [MAX31760 datasheet](https://www.analog.com/media/en/technical-documentation/data-sheets/max31760.pdf) and [Microchip AN771](https://ww1.microchip.com/downloads/en/appnotes/00771a.pdf).
+ThermalForge currently ships one starting profile, **Default**. It is a heuristic starting point rather than a claim about every Mac's ideal calibration. The curve is intentionally system-like and smooth, but starts earlier, reaches 100% at a lower temperature, and responds to a rapid temperature rise so sustained workloads spend less time near throttling temperatures.
 
 | Profile | Fans off | Fans start | Ceiling | Max fan | Curve | Sustained trigger | Behavior |
-|---|---|---|---|---|---|---|---|
-| **Silent (Apple Default)** | N/A | N/A | N/A | Apple | N/A | N/A | Monitoring only. Apple controls fans. |
-| **Balanced** | 50°C | 55°C | 70°C | 60% | Ease-in (pos²) | 8 seconds | Quiet at low temps, ramps harder as heat builds. |
-| **Performance** | 50°C | 55°C | 65°C | 85% | Linear | 4 seconds | Direct proportional response, 2× ramp-up speed. |
-| **Max** | 50°C | 65°C | — | 100% | Instant | 5 seconds | Attack dog: instant 100% when triggered, linear ramp-down. |
-| **Smart** | 50°C | 53°C | 85°C | 100% | S-curve | 6 seconds | Proactive with rate-of-change awareness. Starts 2°C earlier. |
+|---|---:|---:|---:|---:|---|---:|---|
+| **Default** | 50°C | 53°C | 80°C | 100% | S-curve | 2 seconds | Proactive ramp with a modest rising-temperature boost. |
 
-**How profiles work:**
-- **Below 50°C:** All fans off. Machine is at idle.
-- **50°C–start (hysteresis zone):** Fans maintain current state. Already running → stay at minimum. Already off → stay off.
-- **Above start for N seconds:** Fans engage. Balanced and Performance ramp proportionally using their curve shape. Max jumps instantly to 100%.
-- **Between start and ceiling:** Fan speed scales based on the profile's curve shape. Balanced (ease-in) is quiet at low temps — at 62.5°C (midpoint of 55–70°C), fans run at only 15% of max RPM instead of 30% linear. Performance (linear) is proportional. Max has no proportional zone — it's binary.
-- **At ceiling and above:** Fan speed at the profile's maximum (60%/85%/100%).
-- **Ramp down:** Each profile has its own ramp-down rate. Max uses a gentle governor to let temps stabilize before backing off.
+The menu bar app draws the same curve math used by the controller. It labels the approximate start and 100% temperatures; live output can differ because of hysteresis, the sustained trigger, ramp limits, fan minimum RPM, and optional machine calibration.
+
+The fan control loop runs at 100ms by default. The full SMC sensor snapshot runs every 1 second by default and only reads keys found during startup. Both intervals can be changed in the app under **REFRESH**. The expensive full snapshot is reused between samples to keep idle CPU and power low.
+
+To add another profile, define one `FanProfile` value and append it to `FanProfile.available`. The controller, picker, persistence, and curve preview use that registry; no profile-id branch is required.
 
 ## Install
 
-### Option A: Homebrew (recommended)
+### Upstream Homebrew package (not this fork)
 
 ```bash
 brew tap ProducerGuy/tap
@@ -89,12 +83,12 @@ sudo thermalforge install
 
 Homebrew requires third-party taps to be trusted before it will run their formula, which is the `brew trust` step (per-formula, Homebrew's recommended form). `brew install` builds and installs the **CLI**. `sudo thermalforge install` then sets up the background daemon (so the app can control fans without a password every time) **and copies the menu bar app into `/Applications`**. You only run it once.
 
-### Option B: From source
+### Build this fork locally
 
 For local use without an Apple Developer account, build an ad hoc signed app bundle:
 
 ```bash
-git clone https://github.com/ProducerGuy/ThermalForge.git
+git clone https://github.com/XInTheDark/ThermalForge.git
 cd ThermalForge
 ./Scripts/build_local.sh
 open ./dist/ThermalForge.app
@@ -123,35 +117,17 @@ ThermalForge controls fans through a background daemon, and 0.2.0 locks down how
 - **Safety enforced in the daemon.** RPM requests above a fan's maximum are clamped in the daemon, not just the app. Commands are rate-limited. A thermal floor forces fans to maximum if a critical sensor crosses 95°C while a manual hold is keeping them too low — and it runs in the background service, so it works even with the menu bar app closed.
 - **Robust connection handling.** Connections are handled concurrently, bounded, and timed out, so a stuck or slow client can't stall fan control.
 
-## Smart Profile
+## Default profile
 
-### Why proactive cooling matters
+The Default profile is this fork's opinionated starting point: keep the familiar smooth system response while trading some acoustics for thermal headroom. It starts around 53°C, reaches full target around 80°C, waits about two seconds of sustained heat before engaging, and adds a small boost when temperature is rising quickly. Calibration data, when present and valid, supplies the machine-specific base target while these safeguards still apply.
 
-Apple's default fan behavior is reactive: fans stay off until the chip is already hot, then ramp up to recover. This creates a repeating cycle during sustained workloads like renders, compiles, and ML inference:
+The curve is intentionally a heuristic. Apple Silicon models, workloads, ambient temperature, and fan hardware differ, so treat the displayed graph as an estimate and adjust the refresh settings or future profile values after observing your machine.
 
-1. CPU/GPU runs at full clocks, heat builds unchecked
-2. Chip hits ~90°C, starts throttling clock speeds — **10-20% performance loss**
-3. Fans finally ramp up
-4. Temps drop, clocks recover, fans slow down
-5. Heat builds again — repeat
+**Hysteresis:** fans turn on at the start threshold after the sustained trigger and return to Apple auto below the 50°C stop threshold. The gap prevents rapid start/stop cycling.
 
-This sawtooth pattern costs you sustained performance, wears hardware faster (thermal cycling stress on solder joints follows the Coffin-Manson fatigue model — damage scales with temperature swing amplitude, not absolute temperature), and forces fans to work harder because they're always recovering instead of preventing.
+**Ramp limits:** fan changes are rate-limited to avoid abrupt oscillation. The Default profile uses a faster upward limit than the old profiles and a measured downward limit so cooling remains responsive without chasing every sensor fluctuation.
 
-The Smart profile eliminates this. It monitors temperature velocity — not just where the temp is, but how fast it's rising — and ramps fans early enough to hold the chip below 85°C. The result: sustained peak clocks throughout your entire workload, less thermal cycling wear, and fans that run quieter overall because they never need to recover from a heat spike.
-
-Apple doesn't do this because silence sells in store demos and most users never run sustained workloads. ThermalForge gives power users the choice Apple doesn't.
-
-### How Smart works
-
-**The curve:** Smart maps temperature to fan speed across a 53–85°C range using an S-curve (gentle at both ends, steeper in the middle). Below 50°C, fans turn off. Between 50–53°C, fans maintain current state (hysteresis). Above 85°C, fans go to max.
-
-**Rate-of-change awareness:** Smart doesn't just look at where temperature is — it looks at how fast it's moving. If temp is rising at 1°C/sec, Smart boosts fan speed proportionally to get ahead of the climb. If temp is stable or falling, Smart holds steady or eases off gradually.
-
-**Ramp governors:** Fan speed changes are rate-limited for acoustic comfort. Each profile has its own ramp rates — Smart uses ~400 RPM/sec up, ~200 RPM/sec down. This prevents acoustic shock, reduces mechanical stress, and extends fan bearing lifespan by up to 50% compared to abrupt speed changes (source: [NMB fan engineering](https://nmbtc.com/white-papers/dc-brushless-cooling-fan-behavior/), [Analog Devices ADM1031 datasheet](https://www.onsemi.com/download/data-sheet/pdf/adm1031-d.pdf)).
-
-**Hysteresis:** Fans turn on at 53°C (after 6 seconds sustained) and turn off at 50°C — a 3°C gap. Balanced and Performance use 55°C start with a 5°C gap. Max uses 65°C start with a 15°C gap. This prevents rapid on/off cycling, which is the #1 cause of fan bearing wear in fluid dynamic bearing fans (source: [Nidec FDB technology](https://www.nidec.com/en/technology/capability/fdb/), [AnandTech fan lifespan discussion](https://forums.anandtech.com/threads/fan-stop-start-effect-on-lifespan.2284098/)).
-
-**0 to minimum RPM is binary:** Apple Silicon MacBook fans cannot spin below their minimum RPM (2317 on M5 Max, 1200 on M1 Max). When Smart decides fans should run, they jump directly to minimum — this is a hardware limitation of brushless DC motors that require a startup burst to overcome static friction. Above minimum, all speed changes are smooth and governed.
+**0 to minimum RPM is binary:** Apple Silicon fans cannot reliably run below their hardware minimum. When control begins, the command therefore jumps to at least that minimum RPM.
 
 ### FAQ
 
@@ -314,13 +290,13 @@ Nothing accumulates indefinitely. All cleanup runs automatically on app launch.
 A controlled testing framework for anyone who wants to understand their Mac's thermal behavior — modders validating thermal pad swaps, developers profiling their apps, engineers comparing cooling strategies.
 
 ```bash
-thermalforge experiment --workload cpu --fan smart --duration 10m --label "smart-baseline"
+thermalforge experiment --workload cpu --fan default --duration 10m --label "default-baseline"
 thermalforge experiment --workload cpu --fan 75%  --duration 10m --label "fixed-75"
-thermalforge compare smart-baseline fixed-75
+thermalforge compare default-baseline fixed-75
 ```
 
 **Controlled variables:**
-- Fan speed: any profile, fixed percentage, or Smart
+- Fan speed: any profile, fixed percentage, or Default
 - Workload type: CPU stress, GPU stress (Metal compute), CPU+GPU combined, idle baseline, or any custom command
 - Duration with automatic steady-state detection (temp change <0.5°C over 2 minutes)
 - Ambient temperature input for Delta-T calculations

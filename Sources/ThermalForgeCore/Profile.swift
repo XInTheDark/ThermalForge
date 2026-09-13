@@ -7,12 +7,8 @@
 //  Each profile defines a curve that maps temperature to fan speed,
 //  along with per-profile ramp rates, sustained triggers, and curve shapes.
 //
-//  Based on Apple fan hardware research:
-//  - 0 to minimum RPM is binary (hardware limitation)
-//  - Above minimum, proportional ramping with configurable curve shape
-//  - Start/stop cycles are the #1 fan bearing wear factor
-//  - At least 5°C hysteresis between start and stop thresholds
-//  - Ramp governors are acoustic comfort, not bearing protection
+//  Targets are clamped to hardware minimum RPM while control is active.
+//  Hysteresis and ramp limits keep the response stable around thresholds.
 //
 
 import Foundation
@@ -40,8 +36,8 @@ public struct FanProfile: Codable, Identifiable, Equatable {
 
     /// Defines how the profile maps temperature to fan speed.
     public struct Curve: Codable, Equatable {
-        /// Below this temperature, fans turn off (return to Apple auto).
-        /// Must be at least 5°C below startTemp for hysteresis.
+        /// At or below this temperature, return to Apple auto.
+        /// Keep this below startTemp to provide hysteresis.
         public let stopTemp: Float
 
         /// Above this temperature, fans engage (after sustained trigger is met).
@@ -78,11 +74,14 @@ public struct FanProfile: Codable, Identifiable, Equatable {
         /// Ramp-down governor still applies for smooth deceleration.
         public let instantEngage: Bool
 
+        /// Additional fan fraction per °C/sec of rising temperature.
+        public let rateOfChangeBoost: Float
+
         public init(stopTemp: Float = 50, startTemp: Float = 55, ceilingTemp: Float = 70,
                     maxRPMPercent: Float = 0.6, handsOff: Bool = false, alwaysOn: Bool = false,
                     curveShape: CurveShape = .linear, rampUpPerSec: Float = 0.05,
                     rampDownPerSec: Float = 0.025, sustainedTriggerSec: Float = 8,
-                    instantEngage: Bool = false) {
+                    instantEngage: Bool = false, rateOfChangeBoost: Float = 0) {
             self.stopTemp = stopTemp
             self.startTemp = startTemp
             self.ceilingTemp = ceilingTemp
@@ -94,6 +93,29 @@ public struct FanProfile: Codable, Identifiable, Equatable {
             self.rampDownPerSec = rampDownPerSec
             self.sustainedTriggerSec = sustainedTriggerSec
             self.instantEngage = instantEngage
+            self.rateOfChangeBoost = rateOfChangeBoost
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case stopTemp, startTemp, ceilingTemp, maxRPMPercent, handsOff, alwaysOn,
+                 curveShape, rampUpPerSec, rampDownPerSec, sustainedTriggerSec,
+                 instantEngage, rateOfChangeBoost
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            stopTemp = try c.decode(Float.self, forKey: .stopTemp)
+            startTemp = try c.decode(Float.self, forKey: .startTemp)
+            ceilingTemp = try c.decode(Float.self, forKey: .ceilingTemp)
+            maxRPMPercent = try c.decode(Float.self, forKey: .maxRPMPercent)
+            handsOff = try c.decode(Bool.self, forKey: .handsOff)
+            alwaysOn = try c.decode(Bool.self, forKey: .alwaysOn)
+            curveShape = try c.decode(CurveShape.self, forKey: .curveShape)
+            rampUpPerSec = try c.decode(Float.self, forKey: .rampUpPerSec)
+            rampDownPerSec = try c.decode(Float.self, forKey: .rampDownPerSec)
+            sustainedTriggerSec = try c.decode(Float.self, forKey: .sustainedTriggerSec)
+            instantEngage = try c.decode(Bool.self, forKey: .instantEngage)
+            rateOfChangeBoost = try c.decodeIfPresent(Float.self, forKey: .rateOfChangeBoost) ?? 0
         }
 
         /// Calculate the target fan speed percentage (0.0–1.0) for a given temperature.
@@ -124,22 +146,28 @@ public struct FanProfile: Codable, Identifiable, Equatable {
                 // Instant engage profiles jump directly to max (no proportional curve up)
                 if instantEngage { return maxRPMPercent }
 
-                let position = (temp - startTemp) / (ceilingTemp - startTemp)
-                let shaped: Float
-                switch curveShape {
-                case .linear:
-                    shaped = position
-                case .easeIn:
-                    shaped = position * position
-                case .easeOut:
-                    shaped = sqrt(position)
-                case .sCurve:
-                    shaped = position * position * (3 - 2 * position)
-                }
-                return shaped * maxRPMPercent
+                return displayPercent(at: temp)
             }
 
             return nil
+        }
+
+        /// Approximate steady-state target used by the visual curve preview.
+        public func displayPercent(at temp: Float) -> Float {
+            guard !handsOff else { return 0 }
+            if alwaysOn { return maxRPMPercent }
+            guard temp >= startTemp else { return 0 }
+            guard ceilingTemp > startTemp else { return maxRPMPercent }
+            if instantEngage || temp >= ceilingTemp { return maxRPMPercent }
+            let position = min(max((temp - startTemp) / (ceilingTemp - startTemp), 0), 1)
+            let shaped: Float
+            switch curveShape {
+            case .linear: shaped = position
+            case .easeIn: shaped = position * position
+            case .easeOut: shaped = sqrt(position)
+            case .sCurve: shaped = position * position * (3 - 2 * position)
+            }
+            return shaped * maxRPMPercent
         }
     }
 
@@ -169,69 +197,34 @@ public struct FanProfile: Codable, Identifiable, Equatable {
 // MARK: - Built-in Profiles
 
 extension FanProfile {
-    /// Silent (Apple Default): hands-off, let Apple control fans. ThermalForge monitors only.
-    public static let silent = FanProfile(
-        id: "silent",
-        name: "Silent (Apple Default)",
-        curve: Curve(stopTemp: 50, startTemp: 55, ceilingTemp: 55,
-                     maxRPMPercent: 0, handsOff: true)
-    )
-
-    /// Balanced: gentle ease-in curve for everyday use.
-    /// Quiet at low temps (pos²), ramps harder as heat builds.
-    /// 8-second sustained trigger filters all transients.
-    public static let balanced = FanProfile(
-        id: "balanced",
-        name: "Balanced",
-        curve: Curve(stopTemp: 50, startTemp: 55, ceilingTemp: 70,
-                     maxRPMPercent: 0.60, curveShape: .easeIn,
-                     rampUpPerSec: 0.05, rampDownPerSec: 0.025,
-                     sustainedTriggerSec: 8)
-    )
-
-    /// Performance: linear curve, fast response. Thermals over noise.
-    /// 4-second sustained trigger, 2× ramp-up speed vs Balanced.
-    public static let performance = FanProfile(
-        id: "performance",
-        name: "Performance",
-        curve: Curve(stopTemp: 50, startTemp: 55, ceilingTemp: 65,
-                     maxRPMPercent: 0.85, curveShape: .linear,
-                     rampUpPerSec: 0.10, rampDownPerSec: 0.04,
-                     sustainedTriggerSec: 4)
-    )
-
-    /// Max: attack dog. Instant 100% after 5-second sustained trigger at 65°C.
-    /// They spike, we spike. Ramp-down governor lets temps stabilize before backing off.
-    public static let max = FanProfile(
-        id: "max",
-        name: "Max",
-        curve: Curve(stopTemp: 50, startTemp: 65, ceilingTemp: 65,
-                     maxRPMPercent: 1.0, curveShape: .linear,
-                     rampUpPerSec: 1.0, rampDownPerSec: 0.025,
-                     sustainedTriggerSec: 5, instantEngage: true)
-    )
-
-    /// Smart: proactive S-curve with rate-of-change awareness.
-    /// Starts 2°C earlier (53°C) to get ahead of rising temps.
-    /// Uses calibration data when available. 6-second sustained trigger.
-    public static let smart = FanProfile(
-        id: "smart",
-        name: "Smart",
-        curve: Curve(stopTemp: 50, startTemp: 53, ceilingTemp: 85,
+    /// Initial ThermalForge curve: smooth like a system curve, but more proactive
+    /// to preserve sustained performance and reduce hot cycling.
+    public static let `default` = FanProfile(
+        id: "default",
+        name: "Default",
+        curve: Curve(stopTemp: 50, startTemp: 53, ceilingTemp: 80,
                      maxRPMPercent: 1.0, curveShape: .sCurve,
-                     rampUpPerSec: 0.05, rampDownPerSec: 0.025,
-                     sustainedTriggerSec: 6)
+                     rampUpPerSec: 0.12, rampDownPerSec: 0.05,
+                     sustainedTriggerSec: 2, rateOfChangeBoost: 0.15)
     )
 
-    public static let builtIn: [FanProfile] = [silent, balanced, performance, max]
+    /// Central registry for profiles shown in the app and accepted by the CLI.
+    /// Add a profile here; no profile-specific monitor branch is needed.
+    public static let available: [FanProfile] = [`default`]
+    public static let builtIn: [FanProfile] = available
 
-    /// Resolve a persisted profile id to a known profile for launch restore. Searches the
-    /// built-ins plus Smart (which is surfaced via its own button, so it isn't in
-    /// `builtIn`). Returns Silent when the id is nil (nothing saved) or unrecognized (a
-    /// profile removed or renamed in a later version), so a stale saved id never crashes.
+    /// A return-to-system mode, kept separate from the fork's profile registry.
+    public static let system = FanProfile(
+        id: "system", name: "Apple Auto",
+        curve: Curve(maxRPMPercent: 0, handsOff: true)
+    )
+
+    /// Resolve saved or legacy ids to the current profile. Deleted historical profiles
+    /// deliberately map to Default so old preferences remain usable.
     public static func selectable(id: String?) -> FanProfile {
-        guard let id else { return .silent }
-        return (builtIn + [smart]).first { $0.id == id } ?? .silent
+        guard let id else { return `default` }
+        if id == system.id { return system }
+        return available.first { $0.id == id } ?? `default`
     }
 }
 

@@ -2,7 +2,7 @@
 //  Calibration.swift
 //  ThermalForge
 //
-//  Machine-specific thermal calibration data for the Smart profile.
+//  Machine-specific thermal calibration data for adaptive profiles.
 //
 
 import Foundation
@@ -545,7 +545,7 @@ public final class CalibrationRunner {
 
     /// Build monotonically increasing control curve from raw equilibrium data.
     /// Raw data: (fanPct, equilTemp) — higher fan = lower equilibrium (physically correct).
-    /// Control curve: (targetTemp, holdingRPMPercent) — higher temp = higher fan (for Smart).
+    /// Control curve: (targetTemp, holdingRPMPercent) — higher temp = higher fan (for adaptive profiles).
     /// Formula: fan_control(T) = (1.0 + minPct) - F_equil(T)
     private func buildControlCurve(rawData: [(fanPct: Float, equilTemp: Float)], minPct: Float) -> [CalibrationData.Measurement] {
         guard rawData.count >= 2 else { return [] }

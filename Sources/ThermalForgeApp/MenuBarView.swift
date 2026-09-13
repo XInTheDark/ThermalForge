@@ -97,12 +97,14 @@ struct MenuBarView: View {
             Picker("Profile", selection: Binding(
                 get: { appState.activeProfile.id },
                 set: { id in
-                    if let profile = FanProfile.builtIn.first(where: { $0.id == id }) {
+                    if id == FanProfile.system.id {
+                        appState.resetAuto()
+                    } else if let profile = FanProfile.available.first(where: { $0.id == id }) {
                         appState.selectProfile(profile)
                     }
                 }
             )) {
-                ForEach(FanProfile.builtIn) { profile in
+                ForEach(FanProfile.available) { profile in
                     HStack {
                         Text(profile.name)
                         Spacer()
@@ -128,38 +130,34 @@ struct MenuBarView: View {
                     }
                     .tag(profile.id)
                 }
+                Text(FanProfile.system.name)
+                    .tag(FanProfile.system.id)
             }
             .pickerStyle(.inline)
             .labelsHidden()
             .padding(.horizontal, 12)
 
+            if appState.activeProfile.id == FanProfile.system.id {
+                Text("Apple controls the fan curve")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 12)
+            } else {
+                FanCurvePreview(profile: appState.activeProfile, fahrenheit: appState.useFahrenheit)
+                    .padding(.horizontal, 12)
+            }
+
             Divider().padding(.vertical, 4)
 
             // Quick actions
             HStack(spacing: 8) {
-                // Toggle-as-button holds the system fill while Smart is the active
-                // profile — Apple draws it, it honors .tint, and it adapts to light/dark.
-                Toggle(isOn: Binding(
-                    get: { appState.activeProfile.id == "smart" },
-                    set: { isOn in
-                        if isOn {
-                            appState.setSmart()
-                        } else {
-                            // Turning Smart off returns fans to Apple's default (Silent),
-                            // same as the Default button. Required so the toggle can turn
-                            // off at all — otherwise `get` stays true and snaps it back on.
-                            appState.resetAuto()
-                        }
-                    }
-                )) {
-                    Label("Smart", systemImage: "fan.fill")
+                Button(action: { appState.setDefault() }) {
+                    Label("Default", systemImage: "fan.fill")
                         .frame(maxWidth: .infinity)
                 }
-                .toggleStyle(.button)
-                .tint(.orange)
-
+                .buttonStyle(.bordered)
                 Button(action: { appState.resetAuto() }) {
-                    Label("Default", systemImage: "arrow.counterclockwise")
+                    Label("Apple Auto", systemImage: "arrow.counterclockwise")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
@@ -236,6 +234,57 @@ struct MenuBarView: View {
         return interval == floor(interval)
             ? "\(Int(interval)) s"
             : "\(String(format: "%.1f", interval)) s"
+    }
+}
+
+private struct FanCurvePreview: View {
+    let profile: FanProfile
+    let fahrenheit: Bool
+
+    var body: some View {
+        let curve = profile.curve
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Approximate fan curve")
+                .font(.caption.weight(.semibold))
+            Canvas { context, size in
+                let plot = CGRect(x: 28, y: 8, width: max(size.width - 36, 1), height: max(size.height - 28, 1))
+                var path = Path()
+                let minTemp = curve.stopTemp
+                let maxTemp = max(curve.ceilingTemp, curve.startTemp + 1)
+                for index in 0...40 {
+                    let fraction = Float(index) / 40
+                    let temp = minTemp + (maxTemp - minTemp) * fraction
+                    let percent = curve.displayPercent(at: temp)
+                    let point = CGPoint(x: plot.minX + CGFloat(fraction) * plot.width,
+                                        y: plot.maxY - CGFloat(percent) * plot.height)
+                    if index == 0 { path.move(to: point) } else { path.addLine(to: point) }
+                }
+                context.stroke(path, with: .color(.orange), lineWidth: 2)
+                var axes = Path()
+                axes.move(to: CGPoint(x: plot.minX, y: plot.minY)); axes.addLine(to: CGPoint(x: plot.minX, y: plot.maxY))
+                axes.move(to: CGPoint(x: plot.minX, y: plot.maxY)); axes.addLine(to: CGPoint(x: plot.maxX, y: plot.maxY))
+                context.stroke(axes, with: .color(.secondary.opacity(0.5)), lineWidth: 1)
+            }
+            .frame(height: 92)
+            HStack {
+                Text("0%")
+                Spacer()
+                Text("Starts ~\(displayTemp(curve.startTemp))")
+                Spacer()
+                Text("100% ~\(displayTemp(curve.ceilingTemp))")
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            Text("Steady-temperature estimate; ramp delay and hysteresis can change the live result.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func displayTemp(_ celsius: Float) -> String {
+        let value = fahrenheit ? celsius * 9 / 5 + 32 : celsius
+        let unit = fahrenheit ? "F" : "C"
+        return "\(Int(value.rounded()))°\(unit)"
     }
 }
 

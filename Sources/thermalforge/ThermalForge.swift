@@ -350,8 +350,8 @@ struct Watch: ParsableCommand {
         abstract: "Monitor temps and auto-adjust fans based on a profile"
     )
 
-    @Option(name: .shortAndLong, help: "Profile: silent, balanced, performance, max")
-    var profile: String = "balanced"
+    @Option(name: .shortAndLong, help: "Profile id (default: default)")
+    var profile: String = "default"
 
     @Option(name: .shortAndLong, help: "Poll interval in seconds (default 0.1 = 100ms)")
     var interval: Double = 0.1
@@ -435,7 +435,7 @@ struct Watch: ParsableCommand {
 struct Calibrate: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "calibrate",
-        abstract: "Measure this machine's thermal characteristics for the Smart profile"
+        abstract: "Measure this machine's thermal characteristics for the Default profile"
     )
 
     @Option(name: .shortAndLong, help: "Calibration mode: quick (~14 min), standard (~32 min), optimized (until stable)")
@@ -452,7 +452,7 @@ struct Calibrate: ParsableCommand {
         if reset {
             if CalibrationData.exists {
                 try? FileManager.default.removeItem(at: CalibrationData.filePath)
-                print("Calibration data cleared. Smart will use the default curve.")
+                print("Calibration data cleared. Default will use the built-in curve.")
                 TFLogger.shared.calibration("Calibration data reset by user")
             } else {
                 print("No calibration data to clear.")
@@ -527,7 +527,7 @@ struct Calibrate: ParsableCommand {
         for m in data.measurements {
             print("  \(Int(m.targetTemp))°C → \(Int(m.holdingRPMPercent * 100))% fan speed")
         }
-        print("\nThe Smart profile will now use these measurements for this machine.")
+        print("\nThe Default profile will now use these measurements for this machine.")
         if runner.logPath != nil {
             print("The CSV log contains every sensor reading taken during calibration.")
         }
