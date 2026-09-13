@@ -27,6 +27,26 @@ public enum CurveShape: String, Codable, Equatable {
     case sCurve
 }
 
+/// Fixed linear adjustment applied to a curve target for a power-source mode.
+/// `output = clamp(input * multiplier + shift)`.
+public struct FanPercentTransform: Codable, Equatable, Sendable {
+    public let shift: Float
+    public let multiplier: Float
+
+    public init(shift: Float = 0, multiplier: Float = 1) {
+        self.shift = shift
+        self.multiplier = multiplier
+    }
+
+    public func apply(to percent: Float) -> Float {
+        min(max(percent * multiplier + shift, 0), 1)
+    }
+
+    public static let identity = FanPercentTransform()
+    /// Adapter default: a modest extra fan target where mains power is available.
+    public static let adapterDefault = FanPercentTransform(shift: 0.05, multiplier: 1.10)
+}
+
 // MARK: - Profile Model
 
 public struct FanProfile: Codable, Identifiable, Equatable {
@@ -274,4 +294,9 @@ extension FanProfile {
     public static let safetyTempThreshold: Float = 95.0
     /// Hysteresis deadband to prevent oscillation
     public static let hysteresisDegrees: Float = 5.0
+    /// Conservative battery cooling target: begin increasing fan demand at 38°C
+    /// and request full demand by 40°C.
+    public static func batteryCoolingTarget(for temperature: Float) -> Float {
+        min(max((temperature - 38) / 2, 0), 1)
+    }
 }

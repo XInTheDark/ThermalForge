@@ -92,60 +92,49 @@ struct MenuBarView: View {
 
             Divider().padding(.vertical, 4)
 
-            // Profile picker
-            SectionHeader(title: "PROFILE")
-            Picker("Profile", selection: Binding(
-                get: { appState.activeProfile.id },
+            // Power-source profile pickers
+            SectionHeader(title: "PROFILES")
+            Picker("Battery", selection: Binding(
+                get: { appState.batteryProfileID },
                 set: { id in
-                    if id == FanProfile.system.id {
-                        appState.resetAuto()
-                    } else if let profile = FanProfile.available.first(where: { $0.id == id }) {
-                        appState.selectProfile(profile)
+                    if let profile = FanProfile.available.first(where: { $0.id == id }) {
+                        appState.selectBatteryProfile(profile)
                     }
                 }
             )) {
                 ForEach(FanProfile.available) { profile in
-                    HStack {
-                        Text(profile.name)
-                        Spacer()
-                        if !profile.curve.handsOff {
-                            let unit = appState.useFahrenheit ? "F" : "C"
-                            if profile.curve.instantEngage {
-                                // Max: show instant trigger temp
-                                let startC = profile.curve.startTemp
-                                let startDisp = appState.useFahrenheit ? startC * 9 / 5 + 32 : startC
-                                Text("\(Int(startDisp))°\(unit) instant")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            } else {
-                                let startC = profile.curve.startTemp
-                                let ceilC = profile.curve.ceilingTemp
-                                let startDisp = appState.useFahrenheit ? startC * 9 / 5 + 32 : startC
-                                let ceilDisp = appState.useFahrenheit ? ceilC * 9 / 5 + 32 : ceilC
-                                Text("\(Int(startDisp))→\(Int(ceilDisp))°\(unit)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                    .tag(profile.id)
+                    Text(profile.name).tag(profile.id)
                 }
-                Text(FanProfile.system.name)
-                    .tag(FanProfile.system.id)
             }
-            .pickerStyle(.inline)
-            .labelsHidden()
+            .pickerStyle(.menu)
             .padding(.horizontal, 12)
-
-            if appState.activeProfile.id == FanProfile.system.id {
-                Text("Apple controls the fan curve")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-            } else {
-                FanCurvePreview(profile: appState.activeProfile, fahrenheit: appState.useFahrenheit)
-                    .padding(.horizontal, 12)
+            Picker("Power adapter", selection: Binding(
+                get: { appState.adapterProfileID },
+                set: { id in
+                    if let profile = FanProfile.available.first(where: { $0.id == id }) {
+                        appState.selectAdapterProfile(profile)
+                    }
+                }
+            )) {
+                ForEach(FanProfile.available) { profile in
+                    Text(profile.name).tag(profile.id)
+                }
             }
+            .pickerStyle(.menu)
+            .padding(.horizontal, 12)
+            Text(appState.usingExternalPower
+                 ? (appState.adapterBoostEnabled ? "Adapter: +5% shift, ×1.10 fan target" : "Adapter: base fan target")
+                 : "Battery: base fan target")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+
+            FanCurvePreview(profile: appState.usingExternalPower
+                            ? FanProfile.available.first(where: { $0.id == appState.adapterProfileID }) ?? .default
+                            : FanProfile.available.first(where: { $0.id == appState.batteryProfileID }) ?? .default,
+                            transform: appState.usingExternalPower && appState.adapterBoostEnabled ? .adapterDefault : .identity,
+                            fahrenheit: appState.useFahrenheit)
+                .padding(.horizontal, 12)
 
             Divider().padding(.vertical, 4)
 
@@ -163,6 +152,8 @@ struct MenuBarView: View {
                 .buttonStyle(.bordered)
             }
             .padding(.horizontal, 12)
+            Toggle("Adapter cooling boost", isOn: $appState.adapterBoostEnabled)
+                .padding(.horizontal, 12)
 
             Divider().padding(.vertical, 4)
 
@@ -239,6 +230,7 @@ struct MenuBarView: View {
 
 private struct FanCurvePreview: View {
     let profile: FanProfile
+    let transform: FanPercentTransform
     let fahrenheit: Bool
 
     var body: some View {
@@ -254,7 +246,7 @@ private struct FanCurvePreview: View {
                 for index in 0...40 {
                     let fraction = Float(index) / 40
                     let temp = minTemp + (maxTemp - minTemp) * fraction
-                    let percent = curve.displayPercent(at: temp)
+                    let percent = transform.apply(to: curve.displayPercent(at: temp))
                     let point = CGPoint(x: plot.minX + CGFloat(fraction) * plot.width,
                                         y: plot.maxY - CGFloat(percent) * plot.height)
                     if index == 0 { path.move(to: point) } else { path.addLine(to: point) }

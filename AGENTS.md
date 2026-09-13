@@ -17,6 +17,10 @@ Make the smallest change that solves the requested problem. Preserve unrelated e
 
 Sensor snapshots and the control loop are independent settings. Defaults are 1 second and 100 milliseconds respectively. Cache supported SMC thermal keys at startup; do not restore repeated probing of every candidate key. Avoid unnecessary polling, repeated writes, and extra background work.
 
+The controller uses the peak CPU/GPU safety sensors for the main curve, the `TB*` battery sensor as a separate cooling constraint, and fan minimum/maximum RPM for hardware limits. SSD, memory, ambient, and power-delivery sensors are displayed and logged but do not currently drive the curve. Power source is read through IOKit, not by spawning `pmset`. Battery cooling starts increasing demand at 38°C and reaches full demand at 40°C as a conservative policy; Apple publishes recommended ambient ranges, but does not publish a universal battery-pack degradation cutoff, so do not describe 38–40°C as a hard damage threshold.
+
+Battery and external-power profile choices are separate. A `FanPercentTransform` applies `target × multiplier + shift`, clamped to 0–100%. The default adapter transform is ×1.10 plus 5 percentage points; it can be disabled in the app. Keep this transform after the base curve and battery constraint so a profile remains reusable in both modes.
+
 Use lightweight checks during development. Run focused tests for changed behavior, then `swift test` and `git diff --check` before delivery. Build only when needed to validate compile or packaging changes; a rebuild is not required after every edit.
 
 For a local packaged app without a paid Apple Developer account, use `./Scripts/build_local.sh`. It creates the ad hoc signed app and bundled CLI in `dist`. This is a local-use workflow, not distribution or notarization. The app offers installation of the privileged daemon through the normal macOS administrator prompt.

@@ -13,6 +13,15 @@ import SwiftUI
 final class AppState: ObservableObject {
     @Published var latestStatus: ThermalStatus?
     @Published var activeProfile: FanProfile = .system
+    @Published var batteryProfileID: String = UserDefaults.standard.string(forKey: "batteryProfile") ?? "default"
+    @Published var adapterProfileID: String = UserDefaults.standard.string(forKey: "adapterProfile") ?? "default"
+    @Published var adapterBoostEnabled: Bool = UserDefaults.standard.object(forKey: "adapterBoostEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(adapterBoostEnabled, forKey: "adapterBoostEnabled")
+            refreshMonitorProfiles()
+        }
+    }
+    @Published var usingExternalPower = false
     @Published var monitorState: MonitorState = .idle
     @Published var maxTemp: Float?
     @Published var useFahrenheit: Bool = UserDefaults.standard.bool(forKey: "useFahrenheit") {
@@ -81,6 +90,17 @@ final class AppState: ObservableObject {
             return sensorRefreshOptions.contains(value) ? value : fallback
         }
         return controlLoopOptions.contains(value) ? value : fallback
+    }
+
+    private func profileForID(_ id: String) -> FanProfile {
+        FanProfile.available.first(where: { $0.id == id }) ?? .default
+    }
+
+    private func refreshMonitorProfiles() {
+        monitor?.updateProfiles(battery: profileForID(batteryProfileID),
+                                adapter: profileForID(adapterProfileID),
+                                batteryTransform: .identity,
+                                adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity)
     }
 
     /// Runs the 5s heartbeat/version/state polls OFF the main thread so a slow
@@ -376,7 +396,11 @@ final class AppState: ObservableObject {
 
         let monitor = ThermalMonitor(
             fanControl: fc,
-            profile: activeProfile,
+            profile: profileForID(batteryProfileID),
+            batteryProfile: profileForID(batteryProfileID),
+            adapterProfile: profileForID(adapterProfileID),
+            batteryTransform: .identity,
+            adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity,
             sensorRefreshInterval: sensorRefreshInterval,
             controlLoopInterval: controlLoopInterval
         )
@@ -385,12 +409,18 @@ final class AppState: ObservableObject {
                 self?.latestStatus = status
                 self?.activeProfile = profile
                 self?.monitorState = state
+                self?.usingExternalPower = monitor.usingExternalPower
                 // Max of only the displayed sensors
                 // Peak across all CPU and GPU sensors for menu bar display
                 let displayPrefixes = ["TC", "Tp", "TG", "Tg"]
                 self?.maxTemp = status.temperatures
                     .filter { key, _ in displayPrefixes.contains(where: { key.hasPrefix($0) }) }
                     .values.max()
+            }
+        }
+        monitor.onPowerSourceUpdate = { [weak self] source in
+            Task { @MainActor in
+                self?.usingExternalPower = source == .external
             }
         }
         monitor.onFanCommand = { [weak self] command in
@@ -425,9 +455,14 @@ final class AppState: ObservableObject {
 
     func setDefault() {
         let took = seizeControl()
+        batteryProfileID = FanProfile.default.id
+        adapterProfileID = FanProfile.default.id
+        UserDefaults.standard.set(FanProfile.default.id, forKey: "batteryProfile")
+        UserDefaults.standard.set(FanProfile.default.id, forKey: "adapterProfile")
         activeProfile = .default
         persistSelectedProfile(FanProfile.default.id)
-        monitor?.switchProfile(.default)
+        monitor?.updateProfiles(battery: .default, adapter: .default,
+                                batteryTransform: .identity, adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity)
         // Taking over a CLI hold: clear it so the unsupervised hold isn't
         // orphaned; the Default curve then establishes supervised control. Off-main
         // one-shot on the pump (never coalesced/reordered).
@@ -461,9 +496,14 @@ final class AppState: ObservableObject {
 
     func selectProfile(_ profile: FanProfile) {
         let took = seizeControl()
+        batteryProfileID = profile.id
+        adapterProfileID = profile.id
+        UserDefaults.standard.set(profile.id, forKey: "batteryProfile")
+        UserDefaults.standard.set(profile.id, forKey: "adapterProfile")
         activeProfile = profile
         persistSelectedProfile(profile.id)
-        monitor?.switchProfile(profile)
+        monitor?.updateProfiles(battery: profile, adapter: profile,
+                                batteryTransform: .identity, adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity)
         TFLogger.shared.profile("Selected: \(profile.name)")
 
         // Reset to auto when switching to a hands-off profile, OR when taking over
@@ -473,6 +513,21 @@ final class AppState: ObservableObject {
         if profile.curve.handsOff || took {
             commandPump.submit(.resetAuto)
         }
+    }
+
+    func selectBatteryProfile(_ profile: FanProfile) {
+        batteryProfileID = profile.id
+        UserDefaults.standard.set(profile.id, forKey: "batteryProfile")
+        persistSelectedProfile(profile.id)
+        monitor?.updateProfiles(battery: profile, adapter: profileForID(adapterProfileID),
+                                batteryTransform: .identity, adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity)
+    }
+
+    func selectAdapterProfile(_ profile: FanProfile) {
+        adapterProfileID = profile.id
+        UserDefaults.standard.set(profile.id, forKey: "adapterProfile")
+        monitor?.updateProfiles(battery: profileForID(batteryProfileID), adapter: profile,
+                                batteryTransform: .identity, adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity)
     }
 
     // MARK: - Profile persistence

@@ -56,5 +56,17 @@ struct ProfileTests {
     func safety() {
         #expect(FanProfile.safetyTempThreshold == 95)
         #expect(FanProfile.hysteresisDegrees == 5)
+        #expect(FanProfile.batteryCoolingTarget(for: 37) == 0)
+        #expect(FanProfile.batteryCoolingTarget(for: 38) == 0)
+        #expect(FanProfile.batteryCoolingTarget(for: 39) == 0.5)
+        #expect(FanProfile.batteryCoolingTarget(for: 40) == 1)
+    }
+
+    @Test("Power-source transform applies multiplier and shift")
+    func powerTransform() {
+        let transform = FanPercentTransform(shift: 0.05, multiplier: 1.10)
+        #expect(abs(transform.apply(to: 0.5) - 0.60) < 0.001)
+        #expect(transform.apply(to: 0.99) == 1)
+        #expect(FanPercentTransform.identity.apply(to: 0.42) == 0.42)
     }
 }

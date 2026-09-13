@@ -54,6 +54,7 @@ public final class ThermalMonitor {
     private let queue = DispatchQueue(label: "com.thermalforge.monitor")
 
     public private(set) var activeProfile: FanProfile
+    public private(set) var usingExternalPower = false
     public private(set) var state: MonitorState = .idle
     public private(set) var latestStatus: ThermalStatus?
 
@@ -78,6 +79,10 @@ public final class ThermalMonitor {
     private var lastAppliedRPMPercent: Float = 0
     private var fansCurrentlyRunning = false
     private var sustainedAboveCount = 0
+    private var batteryProfile: FanProfile
+    private var adapterProfile: FanProfile
+    private var batteryTransform: FanPercentTransform
+    private var adapterTransform: FanPercentTransform
 
     // MARK: - Temperature History
 
@@ -111,14 +116,23 @@ public final class ThermalMonitor {
 
     /// Called on UI update cadence (every 500ms) with updated status
     public var onUpdate: ((ThermalStatus, FanProfile, MonitorState) -> Void)?
+    public var onPowerSourceUpdate: ((PowerSourceState) -> Void)?
     /// Called when a fan command needs to be executed (may require privilege)
     public var onFanCommand: ((FanCommand) throws -> Void)?
 
     public init(fanControl: FanControl, profile: FanProfile = .default,
+                batteryProfile: FanProfile? = nil,
+                adapterProfile: FanProfile? = nil,
+                batteryTransform: FanPercentTransform = .identity,
+                adapterTransform: FanPercentTransform = .adapterDefault,
                 sensorRefreshInterval: TimeInterval = 1.0,
                 controlLoopInterval: TimeInterval = 0.1) {
         self.fanControl = fanControl
         self.activeProfile = profile
+        self.batteryProfile = batteryProfile ?? profile
+        self.adapterProfile = adapterProfile ?? profile
+        self.batteryTransform = batteryTransform
+        self.adapterTransform = adapterTransform
         self.tickInterval = max(controlLoopInterval, 0.05)
         self.sensorRefreshInterval = max(sensorRefreshInterval, self.tickInterval)
     }
@@ -184,6 +198,36 @@ public final class ThermalMonitor {
         }
     }
 
+    public func updateProfiles(battery: FanProfile, adapter: FanProfile,
+                               batteryTransform: FanPercentTransform,
+                               adapterTransform: FanPercentTransform) {
+        queue.async {
+            self.batteryProfile = battery
+            self.adapterProfile = adapter
+            self.batteryTransform = batteryTransform
+            self.adapterTransform = adapterTransform
+            self.activeProfile = self.usingExternalPower ? adapter : battery
+            self.lastAppliedRPMPercent = 0
+            self.fansCurrentlyRunning = false
+            self.sustainedAboveCount = 0
+            self.tempHistory.removeAll()
+        }
+    }
+
+    public func updatePowerSource(_ source: PowerSourceState) {
+        queue.async {
+            let external = source == .external
+            guard external != self.usingExternalPower else { return }
+            self.usingExternalPower = external
+            self.activeProfile = external ? self.adapterProfile : self.batteryProfile
+            self.lastAppliedRPMPercent = 0
+            self.sustainedAboveCount = 0
+            self.tempHistory.removeAll()
+            self.state = .idle
+            self.onPowerSourceUpdate?(source)
+        }
+    }
+
     // MARK: - Polling
 
     private func tick() {
@@ -195,6 +239,7 @@ public final class ThermalMonitor {
             cachedStatus = fresh
             lastSensorReadUptime = now
             status = fresh
+            updatePowerSource(SystemPowerSource.current)
         } else {
             guard let cachedStatus else { return }
             status = cachedStatus
@@ -326,6 +371,7 @@ public final class ThermalMonitor {
 
     private func tickCurve(status: ThermalStatus, peakTemp: Float, sampleHistory: Bool) {
         let curve = activeProfile.curve
+        let transform = usingExternalPower ? adapterTransform : batteryTransform
         let maxRPM = status.fans.first.map { Float($0.maxRPM) } ?? 7826
         let minRPM = status.fans.first.map { Float($0.minRPM) } ?? 2317
 
@@ -345,8 +391,13 @@ public final class ThermalMonitor {
             if tempHistory.count > 4 { tempHistory.removeFirst() }
         }
 
-        // Get target from the shared curve math.
-        guard let rawTarget = curve.targetPercent(at: peakTemp, fansCurrentlyRunning: fansCurrentlyRunning) else {
+        let batteryTemp = status.temperatures.filter { $0.key.hasPrefix("TB") }.values.max()
+        let batteryPressure = batteryTemp.map(FanProfile.batteryCoolingTarget) ?? 0
+
+        // Get target from the shared curve math. Battery pressure can engage the
+        // fans even while CPU/GPU temperature is below the profile start point.
+        let curveTarget = curve.targetPercent(at: peakTemp, fansCurrentlyRunning: fansCurrentlyRunning)
+        if curveTarget == nil && batteryPressure <= 0 {
             // Curve says fans should be off
             if fansCurrentlyRunning {
                 applyCommand(.resetAuto)
@@ -357,6 +408,7 @@ public final class ThermalMonitor {
             }
             return
         }
+        let rawTarget = curveTarget ?? batteryPressure
 
         // Sustained trigger: per-profile duration.
         // Converted to tick count at runtime based on tick interval.
@@ -376,6 +428,14 @@ public final class ThermalMonitor {
             if rate > 0 { targetPct += rate * curve.rateOfChangeBoost }
         }
         if peakTemp >= curve.ceilingTemp { targetPct = curve.maxRPMPercent }
+
+        // Battery packs are kept below a conservative 40°C target. The SMC
+        // battery sensor is advisory; CPU/GPU safety override remains separate.
+        if batteryTemp != nil, batteryPressure > 0 {
+            targetPct = max(targetPct, batteryPressure)
+        }
+
+        targetPct = transform.apply(to: targetPct)
 
         // Clamp to valid range
         targetPct = min(max(targetPct, minRPM / maxRPM), curve.maxRPMPercent)

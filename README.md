@@ -68,6 +68,10 @@ The menu bar app draws the same curve math used by the controller. It labels the
 
 The fan control loop runs at 100ms by default. The full SMC sensor snapshot runs every 1 second by default and only reads keys found during startup. Both intervals can be changed in the app under **REFRESH**. The expensive full snapshot is reused between samples to keep idle CPU and power low.
 
+The main curve follows the highest CPU/GPU safety sensor. The app also reads the `TB*` battery temperature sensor: fan demand starts increasing at 38°C and reaches full demand at 40°C. This is a conservative operating target, not a published battery damage threshold. Apple documents recommended ambient ranges for Mac notebooks but does not publish one universal battery-pack degradation temperature. SSD, memory, ambient, and power-delivery sensors are shown and logged for context; they do not currently drive the fan target.
+
+Battery and power-adapter modes have separate profile selections. On the adapter, **Default** applies a small extra cooling transform of `target × 1.10 + 5 percentage points`, clamped to 100%; the app includes a toggle to disable that boost. On battery, the selected curve is used directly. The rationale is to spend available wall power on thermal headroom while keeping battery operation quieter and more efficient.
+
 To add another profile, define one `FanProfile` value and append it to `FanProfile.available`. The controller, picker, persistence, and curve preview use that registry; no profile-id branch is required.
 
 ## Install
