@@ -79,7 +79,7 @@ struct MenuBarView: View {
                         Text("Fan \(fan.index)")
                             .foregroundStyle(.secondary)
                         Spacer()
-                        Text(fan.actualPercent.map { "\($0)%" } ?? "—")
+                        Text(fanSpeedLabel(fan))
                             .font(.system(.body, design: .monospaced))
                             .help("Actual RPM within this fan's minimum-to-maximum range.")
                         Text("\(fan.actualRPM) RPM")
@@ -148,9 +148,7 @@ struct MenuBarView: View {
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 12)
 
-            FanCurvePreview(profile: appState.usingExternalPower
-                            ? FanProfile.available.first(where: { $0.id == appState.adapterProfileID }) ?? .default
-                            : FanProfile.available.first(where: { $0.id == appState.batteryProfileID }) ?? .default,
+            FanCurvePreview(profile: appState.currentPreviewProfile,
                             transform: appState.usingExternalPower && appState.adapterBoostEnabled ? .adapterDefault : .identity,
                             fahrenheit: appState.useFahrenheit)
                 .padding(.horizontal, 12)
@@ -238,6 +236,17 @@ struct MenuBarView: View {
         guard let temps = appState.latestStatus?.temperatures else { return nil }
         let values = temps.filter { key, _ in prefixes.contains(where: { key.hasPrefix($0) }) }.values
         return values.max()
+    }
+
+    private func fanSpeedLabel(_ fan: ThermalStatus.FanStatus) -> String {
+        if fan.actualRPM == 0 {
+            return "Off"
+        }
+        guard let percent = fan.actualPercent else { return "—" }
+        if percent == 0 {
+            return "Min"
+        }
+        return "\(percent)%"
     }
 }
 

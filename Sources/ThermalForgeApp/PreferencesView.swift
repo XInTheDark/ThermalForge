@@ -12,7 +12,8 @@ struct PreferencesView: View {
     @EnvironmentObject var appState: AppState
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
             // Header
             HStack(spacing: 10) {
                 Image(systemName: "gearshape.fill")
@@ -142,6 +143,43 @@ struct PreferencesView: View {
 
             Divider()
 
+            // Hybrid Control (Low Temperature Regime)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("HYBRID CONTROL (LOW TEMPERATURE REGIME)")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.secondary)
+
+                Toggle("Enable low-temperature hybrid mode", isOn: $appState.lowTempRegimeEnabled)
+                    .fontWeight(.medium)
+
+                HStack {
+                    Text("Minimum takeover temperature")
+                        .font(.subheadline)
+                    Spacer()
+                    TextField("", value: lowTempBinding, format: .number)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 55)
+                        .multilineTextAlignment(.trailing)
+                    Text(appState.useFahrenheit ? "°F" : "°C")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    Stepper("", value: lowTempBinding, in: appState.useFahrenheit ? 110...185 : 45...85, step: 1)
+                        .labelsHidden()
+                }
+                .disabled(!appState.lowTempRegimeEnabled)
+                .opacity(appState.lowTempRegimeEnabled ? 1.0 : 0.5)
+
+                Text(appState.lowTempRegimeEnabled
+                     ? "Below this threshold, fan control is handed to macOS (Apple Auto) so fans stay silent (0 RPM). ThermalForge only takes control when CPU temperature rises above this threshold. Default: 60°C (140°F)."
+                     : "When disabled, ThermalForge always controls the fans at minimum hardware RPM or higher, actively cooling the heatsink without returning to Apple Auto.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider()
+
             // General
             VStack(alignment: .leading, spacing: 8) {
                 Text("GENERAL")
@@ -155,9 +193,30 @@ struct PreferencesView: View {
             }
 
             Spacer()
+            }
+            .padding(20)
         }
-        .padding(20)
-        .frame(width: 420, height: 630)
+        .frame(width: 440, height: 720)
+    }
+
+    private var lowTempBinding: Binding<Double> {
+        Binding(
+            get: {
+                if appState.useFahrenheit {
+                    return round(appState.lowTempThreshold * 9 / 5 + 32)
+                } else {
+                    return round(appState.lowTempThreshold)
+                }
+            },
+            set: { newValue in
+                if appState.useFahrenheit {
+                    let celsius = (newValue - 32) * 5 / 9
+                    appState.lowTempThreshold = celsius
+                } else {
+                    appState.lowTempThreshold = newValue
+                }
+            }
+        )
     }
 
     private func formatSafetyLimit(_ tempC: Double) -> String {

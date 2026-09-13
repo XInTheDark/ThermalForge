@@ -74,6 +74,20 @@ final class AppState: ObservableObject {
             commandPump.submit(.setSafetyLimit(Float(clamped)))
         }
     }
+    @Published var lowTempThreshold: Double = AppState.loadLowTempThreshold() {
+        didSet {
+            let clamped = min(max(lowTempThreshold, 45.0), 85.0)
+            if clamped != lowTempThreshold { lowTempThreshold = clamped; return }
+            UserDefaults.standard.set(clamped, forKey: Self.lowTempThresholdKey)
+            refreshMonitorProfiles()
+        }
+    }
+    @Published var lowTempRegimeEnabled: Bool = UserDefaults.standard.object(forKey: AppState.lowTempRegimeEnabledKey) as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(lowTempRegimeEnabled, forKey: Self.lowTempRegimeEnabledKey)
+            refreshMonitorProfiles()
+        }
+    }
     @Published var smoothedPeakTemp: Float?
     /// Reflects the current SMAppService login-item status so the menu toggle shows the
     /// right state. Initialized from that status as the property's DEFAULT (not reassigned
@@ -141,6 +155,8 @@ final class AppState: ObservableObject {
     static let rampUpWindowSecondsKey = "rampUpWindowSeconds"
     static let rampDownWindowSecondsKey = "rampDownWindowSeconds"
     static let safetyLimitTempKey = "safetyLimitTemperature"
+    static let lowTempThresholdKey = "lowTempThreshold"
+    static let lowTempRegimeEnabledKey = "lowTempRegimeEnabled"
     static let sensorRefreshOptions: [Double] = [0.5, 1.0, 2.0, 5.0]
     static let controlLoopOptions: [Double] = [0.05, 0.1, 0.25, 0.5]
 
@@ -161,13 +177,26 @@ final class AppState: ObservableObject {
         return min(max(value, 85.0), 115.0)
     }
 
+    private static func loadLowTempThreshold() -> Double {
+        let value = UserDefaults.standard.object(forKey: lowTempThresholdKey) as? Double ?? 60.0
+        guard value.isFinite else { return 60.0 }
+        return min(max(value, 45.0), 85.0)
+    }
+
     private func profileForID(_ id: String) -> FanProfile {
         FanProfile.available.first(where: { $0.id == id }) ?? .default
     }
 
+    var currentPreviewProfile: FanProfile {
+        let base = usingExternalPower ? profileForID(adapterProfileID) : profileForID(batteryProfileID)
+        return base.withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
+    }
+
     private func refreshMonitorProfiles() {
-        monitor?.updateProfiles(battery: profileForID(batteryProfileID),
-                                adapter: profileForID(adapterProfileID),
+        let bat = profileForID(batteryProfileID).withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
+        let adp = profileForID(adapterProfileID).withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
+        monitor?.updateProfiles(battery: bat,
+                                adapter: adp,
                                 batteryTransform: .identity,
                                 adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity)
     }
@@ -535,11 +564,14 @@ final class AppState: ObservableObject {
     func startMonitoring() {
         guard let fc = try? FanControl() else { return }
 
+        let batteryProf = profileForID(batteryProfileID).withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
+        let adapterProf = profileForID(adapterProfileID).withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
+
         let monitor = ThermalMonitor(
             fanControl: fc,
-            profile: profileForID(batteryProfileID),
-            batteryProfile: profileForID(batteryProfileID),
-            adapterProfile: profileForID(adapterProfileID),
+            profile: batteryProf,
+            batteryProfile: batteryProf,
+            adapterProfile: adapterProf,
             batteryTransform: .identity,
             adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity,
             sensorRefreshInterval: sensorRefreshInterval,
@@ -652,8 +684,7 @@ final class AppState: ObservableObject {
         activeProfile = .default
         monitor?.clearFaultForUserRetry()
         persistSelectedProfile(FanProfile.default.id)
-        monitor?.updateProfiles(battery: .default, adapter: .default,
-                                batteryTransform: .identity, adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity)
+        refreshMonitorProfiles()
         TFLogger.shared.profile("Default profile activated")
     }
 
@@ -746,8 +777,7 @@ final class AppState: ObservableObject {
         activeProfile = profile
         monitor?.clearFaultForUserRetry()
         persistSelectedProfile(profile.id)
-        monitor?.updateProfiles(battery: profile, adapter: profile,
-                                batteryTransform: .identity, adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity)
+        refreshMonitorProfiles()
         TFLogger.shared.profile("Selected: \(profile.name)")
     }
 
@@ -760,8 +790,7 @@ final class AppState: ObservableObject {
         batteryProfileID = profile.id
         UserDefaults.standard.set(profile.id, forKey: "batteryProfile")
         persistSelectedProfile(profile.id)
-        monitor?.updateProfiles(battery: profile, adapter: profileForID(adapterProfileID),
-                                batteryTransform: .identity, adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity)
+        refreshMonitorProfiles()
     }
 
     func selectAdapterProfile(_ profile: FanProfile) {
@@ -772,8 +801,8 @@ final class AppState: ObservableObject {
         monitor?.clearFaultForUserRetry()
         adapterProfileID = profile.id
         UserDefaults.standard.set(profile.id, forKey: "adapterProfile")
-        monitor?.updateProfiles(battery: profileForID(batteryProfileID), adapter: profile,
-                                batteryTransform: .identity, adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity)
+        persistSelectedProfile(profile.id)
+        refreshMonitorProfiles()
     }
 
     // MARK: - Profile persistence

@@ -17,8 +17,8 @@ struct ProfileTests {
     func defaultCurve() {
         let profile = FanProfile.default
         #expect(profile.name == "Default")
-        #expect(profile.curve.stopTemp == 50)
-        #expect(profile.curve.startTemp == 55)
+        #expect(profile.curve.stopTemp == 55)
+        #expect(profile.curve.startTemp == 60)
         #expect(profile.curve.ceilingTemp == 92)
         #expect(profile.curve.maxRPMPercent == 1)
         #expect(profile.curve.curveShape == .sCurve)
@@ -30,15 +30,52 @@ struct ProfileTests {
     func curveMath() {
         let curve = FanProfile.default.curve
         #expect(curve.targetPercent(at: 45, fansCurrentlyRunning: false) == nil)
-        #expect(curve.targetPercent(at: 52, fansCurrentlyRunning: false) == nil)
-        #expect(curve.targetPercent(at: 52, fansCurrentlyRunning: true) == 0.001)
+        #expect(curve.targetPercent(at: 54, fansCurrentlyRunning: false) == nil)
+        #expect(curve.targetPercent(at: 57, fansCurrentlyRunning: false) == nil)
+        #expect(curve.targetPercent(at: 57, fansCurrentlyRunning: true) == 0.001)
         #expect(curve.targetPercent(at: 92, fansCurrentlyRunning: true) == 1)
-        #expect(curve.displayPercent(at: 50) == 0)
+        #expect(curve.displayPercent(at: 55) == 0)
+        #expect(curve.displayPercent(at: 60) == 0)
         #expect(curve.displayPercent(at: 92) == 1)
-        #expect(curve.displayPercent(at: 73.5) > 0.45)
-        #expect(curve.displayPercent(at: 73.5) < 0.55)
-        #expect(curve.displayPercent(at: 80) > 0.70)
-        #expect(curve.displayPercent(at: 80) < 0.80)
+        #expect(abs(curve.displayPercent(at: 76) - 0.50) < 0.01)
+        #expect(curve.displayPercent(at: 82) > 0.65)
+        #expect(curve.displayPercent(at: 82) < 0.85)
+    }
+
+    @Test("Custom low-temperature threshold adjusts curve and hysteresis")
+    func lowTemperatureRegime() {
+        let base = FanProfile.default
+        let customized = base.withLowTempThreshold(65)
+        #expect(customized.curve.startTemp == 65)
+        #expect(customized.curve.stopTemp == 60)
+        #expect(customized.curve.ceilingTemp == 92)
+
+        // Below start threshold: stays off (hands off to Apple Auto)
+        #expect(customized.curve.targetPercent(at: 62, fansCurrentlyRunning: false) == nil)
+
+        // In hysteresis band: keeps running if already running
+        #expect(customized.curve.targetPercent(at: 62, fansCurrentlyRunning: true) == 0.001)
+
+        // At or below stop threshold: turns off
+        #expect(customized.curve.targetPercent(at: 60, fansCurrentlyRunning: true) == nil)
+        #expect(customized.curve.targetPercent(at: 58, fansCurrentlyRunning: true) == nil)
+
+        // Above start threshold: active curve
+        #expect(customized.curve.targetPercent(at: 66, fansCurrentlyRunning: false) != nil)
+        #expect(customized.curve.targetPercent(at: 92, fansCurrentlyRunning: true) == 1.0)
+
+        // Apple Auto (handsOff) profile is unaffected
+        let systemCustomized = FanProfile.system.withLowTempThreshold(65)
+        #expect(systemCustomized.curve.handsOff == true)
+        #expect(systemCustomized.curve.targetPercent(at: 70, fansCurrentlyRunning: false) == nil)
+
+        // When low-temperature hybrid mode is disabled, app always takes control at minimum RPM or higher
+        let alwaysActive = base.withLowTempThreshold(enabled: false, threshold: 60)
+        #expect(alwaysActive.curve.stopTemp == 0)
+        #expect(alwaysActive.curve.startTemp == 60)
+        #expect(alwaysActive.curve.targetPercent(at: 40, fansCurrentlyRunning: false) == 0.001)
+        #expect(alwaysActive.curve.targetPercent(at: 40, fansCurrentlyRunning: true) == 0.001)
+        #expect((alwaysActive.curve.targetPercent(at: 76, fansCurrentlyRunning: true) ?? 0) > 0.4)
     }
 
     @Test("Curve JSON remains backward compatible")

@@ -97,7 +97,7 @@ public struct FanProfile: Codable, Identifiable, Equatable {
         /// Additional fan fraction per °C/sec of rising temperature.
         public let rateOfChangeBoost: Float
 
-        public init(stopTemp: Float = 50, startTemp: Float = 55, ceilingTemp: Float = 70,
+        public init(stopTemp: Float = 55, startTemp: Float = 60, ceilingTemp: Float = 70,
                     maxRPMPercent: Float = 0.6, handsOff: Bool = false, alwaysOn: Bool = false,
                     curveShape: CurveShape = .linear, rampUpPerSec: Float = 0.05,
                     rampDownPerSec: Float = 0.025, sustainedTriggerSec: Float = 8,
@@ -148,6 +148,17 @@ public struct FanProfile: Codable, Identifiable, Equatable {
             // Hands-off profiles don't control fans
             if handsOff { return nil }
 
+            // When stopTemp is 0 or negative, low-temperature regime is disabled:
+            // the app always takes control at minimum RPM even below startTemp.
+            if stopTemp <= 0 {
+                if temp >= startTemp {
+                    if temp >= ceilingTemp { return maxRPMPercent }
+                    if instantEngage { return maxRPMPercent }
+                    return max(displayPercent(at: temp), 0.001)
+                }
+                return 0.001
+            }
+
             // Below stop threshold and fans not running: stay off
             if temp <= stopTemp && !fansCurrentlyRunning { return nil }
 
@@ -189,12 +200,50 @@ public struct FanProfile: Codable, Identifiable, Equatable {
             }
             return shaped * maxRPMPercent
         }
+
+        /// Adjusts the low temperature threshold (startTemp) and hysteresis (stopTemp)
+        /// while preserving handsOff/alwaysOn profiles and scaling the curve smoothly.
+        /// When `enabled` is false, `stopTemp` is set to 0 so the app always takes control
+        /// at minimum RPM or higher without returning to Apple Auto.
+        public func withLowTempThreshold(enabled: Bool = true, threshold: Float, hysteresis: Float = FanProfile.hysteresisDegrees) -> Curve {
+            guard !handsOff, !alwaysOn else { return self }
+            let clampedStart = min(max(threshold, 40), 85)
+            let clampedStop = enabled ? max(clampedStart - hysteresis, 30) : 0
+            let effectiveCeiling = max(ceilingTemp, clampedStart + 5)
+            return Curve(
+                stopTemp: clampedStop,
+                startTemp: clampedStart,
+                ceilingTemp: effectiveCeiling,
+                maxRPMPercent: maxRPMPercent,
+                handsOff: handsOff,
+                alwaysOn: alwaysOn,
+                curveShape: curveShape,
+                rampUpPerSec: rampUpPerSec,
+                rampDownPerSec: rampDownPerSec,
+                sustainedTriggerSec: sustainedTriggerSec,
+                instantEngage: instantEngage,
+                rateOfChangeBoost: rateOfChangeBoost
+            )
+        }
+        public func withLowTempThreshold(_ threshold: Float, hysteresis: Float = FanProfile.hysteresisDegrees) -> Curve {
+            withLowTempThreshold(enabled: true, threshold: threshold, hysteresis: hysteresis)
+        }
     }
 
     public init(id: String, name: String, curve: Curve) {
         self.id = id
         self.name = name
         self.curve = curve
+    }
+
+    /// Returns a copy of this profile with its curve's low-temperature threshold adjusted.
+    public func withLowTempThreshold(enabled: Bool = true, threshold: Float, hysteresis: Float = FanProfile.hysteresisDegrees) -> FanProfile {
+        FanProfile(id: id, name: name, curve: curve.withLowTempThreshold(enabled: enabled, threshold: threshold, hysteresis: hysteresis))
+    }
+
+    /// Returns a copy of this profile with its curve's low-temperature threshold adjusted.
+    public func withLowTempThreshold(_ threshold: Float, hysteresis: Float = FanProfile.hysteresisDegrees) -> FanProfile {
+        withLowTempThreshold(enabled: true, threshold: threshold, hysteresis: hysteresis)
     }
 
     // Legacy support — old profiles used triggers/fanBehavior
@@ -222,7 +271,7 @@ extension FanProfile {
     public static let `default` = FanProfile(
         id: "default",
         name: "Default",
-        curve: Curve(stopTemp: 50, startTemp: 55, ceilingTemp: 92,
+        curve: Curve(stopTemp: 55, startTemp: 60, ceilingTemp: 92,
                      maxRPMPercent: 1.0, curveShape: .sCurve,
                      rampUpPerSec: 0.12, rampDownPerSec: 0.05,
                      sustainedTriggerSec: 2, rateOfChangeBoost: 0.15)
