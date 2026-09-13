@@ -402,14 +402,15 @@ public final class ThermalMonitor {
             return
         }
 
-        // Peak CPU (TC/Tp) + GPU (TG/Tg) — the shared safety-floor sensor extraction,
-        // so the client monitor and the daemon's floor read the identical value.
-        let maxTemp = status.safetyPeakTemp
+        // Core peak (CPU/GPU core diodes matching Stats) drives the fan profile curve.
+        // Hotspot/junction peak drives the safety floor and emergency watchdog.
+        let corePeak = status.nominalPeakTemp
         let timeConstant = isRampingDown ? temperatureFilter.rampDownWindowSeconds : temperatureFilter.rampUpWindowSeconds
-        let effectiveTemp = temperatureFilter.update(rawTemp: maxTemp, timeConstant: timeConstant, nowUptime: now)
+        let effectiveTemp = temperatureFilter.update(rawTemp: corePeak, timeConstant: timeConstant, nowUptime: now)
         filteredPeakTemp = effectiveTemp
 
-        let anySensorMax = status.temperatures.values.max() ?? maxTemp
+        let safetyPeak = status.safetyPeakTemp
+        let anySensorMax = status.temperatures.values.max() ?? safetyPeak
         if manualControlActive, anySensorMax >= safetyLimitTemp {
             applyCommand(.safetyMax)
             state = .safetyOverride
@@ -427,7 +428,7 @@ public final class ThermalMonitor {
 
         let monitorDue = elapsedSince(lastMonitorUptime, now) >= Self.monitorInterval
         if monitorDue {
-            monitorTick(status: status, maxTemp: maxTemp)
+            monitorTick(status: status, maxTemp: corePeak)
             lastMonitorUptime = now
         }
 

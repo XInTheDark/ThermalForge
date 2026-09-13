@@ -97,11 +97,12 @@ struct MenuBarView: View {
 
                 // Temperatures
                 SectionHeader(title: "TEMPERATURES")
-                TemperatureRow(label: "CPU", value: appState.temperatureSmoothingEnabled ? (appState.smoothedPeakTemp ?? peakTemp(prefixes: ["TC", "Tp"])) : peakTemp(prefixes: ["TC", "Tp"]), fahrenheit: appState.useFahrenheit)
-                TemperatureRow(label: "GPU", value: peakTemp(prefixes: ["TG", "Tg"]), fahrenheit: appState.useFahrenheit)
+                TemperatureRow(label: "CPU", value: appState.temperatureSmoothingEnabled ? (appState.smoothedPeakTemp ?? appState.latestStatus?.cpuCoreMaxTemp ?? peakTemp(prefixes: ["TC", "Tp", "Te", "Tf"])) : (appState.latestStatus?.cpuCoreMaxTemp ?? peakTemp(prefixes: ["TC", "Tp", "Te", "Tf"])), fahrenheit: appState.useFahrenheit)
+                    .help(cpuHelpText)
+                TemperatureRow(label: "GPU", value: appState.latestStatus?.gpuCoreMaxTemp ?? peakTemp(prefixes: ["TG", "Tg"]), fahrenheit: appState.useFahrenheit)
                 TemperatureRow(label: "RAM", value: peakTemp(prefixes: ["TR", "Tm", "TM"]), fahrenheit: appState.useFahrenheit)
                 TemperatureRow(label: "SSD", value: peakTemp(prefixes: ["TH"]), fahrenheit: appState.useFahrenheit)
-                TemperatureRow(label: "Ambient", value: peakTemp(prefixes: ["TA"]), fahrenheit: appState.useFahrenheit)
+                TemperatureRow(label: "Ambient", value: peakTemp(prefixes: ["TA", "Ta"]), fahrenheit: appState.useFahrenheit)
             } else {
                 Text("Reading sensors...")
                     .foregroundStyle(.secondary)
@@ -224,6 +225,13 @@ struct MenuBarView: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    private var cpuHelpText: String {
+        if let hotspot = appState.latestStatus?.siliconHotspotTemp {
+            return "CPU Core Peak · Hotspot: \(String(format: "%.1f", hotspot))°C"
+        }
+        return "Hottest CPU core diode"
     }
 
     private func peakTemp(prefixes: [String]) -> Float? {

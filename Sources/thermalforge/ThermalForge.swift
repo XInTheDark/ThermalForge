@@ -398,10 +398,10 @@ struct Watch: ParsableCommand {
                     print(line)
                 }
             } else {
-                let cpuTemp = status.temperatures
-                    .filter { k, _ in k.hasPrefix("TC") || k.hasPrefix("Tp") }
+                let cpuTemp = status.cpuCoreMaxTemp ?? status.temperatures
+                    .filter { k, _ in ["TC", "Tp", "Te", "Tf"].contains(where: { k.hasPrefix($0) }) }
                     .values.max() ?? 0
-                let gpuTemp = status.temperatures
+                let gpuTemp = status.gpuCoreMaxTemp ?? status.temperatures
                     .filter { k, _ in k.hasPrefix("TG") || k.hasPrefix("Tg") }
                     .values.max() ?? 0
                 let fan0 = status.fans.first.map { $0.actualRPM } ?? 0
@@ -412,7 +412,7 @@ struct Watch: ParsableCommand {
                 case .safetyOverride: stateLabel = "SAFETY"
                 }
                 let timestamp = ISO8601DateFormatter().string(from: Date())
-                print("[\(timestamp)] CPU: \(String(format: "%.0f", cpuTemp))°C  GPU: \(String(format: "%.0f", gpuTemp))°C  Fan: \(fan0) RPM  [\(stateLabel)]")
+                print("[\(timestamp)] CPU: \(String(format: "%.0f", cpuTemp))°C  Hotspot: \(String(format: "%.0f", status.siliconHotspotTemp))°C  GPU: \(String(format: "%.0f", gpuTemp))°C  Fan: \(fan0) RPM  [\(stateLabel)]")
             }
         }
 

@@ -72,20 +72,63 @@ extension ThermalStatus {
 
     public var hasUsableSafetyTemperature: Bool {
         temperatures.keys.contains { key in
-            ["TC", "Tp", "TG", "Tg"].contains { key.hasPrefix($0) }
+            ["TC", "Tp", "Te", "Tf", "TG", "Tg"].contains { key.hasPrefix($0) }
         }
     }
 
-    /// Peak of the CPU (`TC`/`Tp`) and GPU (`TG`/`Tg`) sensors — the temperature the
-    /// thermal safety floor watches. Single source of truth so the client
-    /// `ThermalMonitor` and the daemon's floor read the identical value; mirroring
-    /// can't drift because it's the same code.
+    /// Peak of the CPU core diodes (matching Stats' "Hottest CPU").
+    /// Uses nominal core diodes across M1-M5 and Intel. Falls back to
+    /// non-hotspot CPU sensors if specific core keys aren't matched.
+    public var cpuCoreMaxTemp: Float? {
+        let coreTemps = temperatures.filter { key, _ in
+            FanControl.cpuCoreKeys.contains(key)
+        }.values
+        if let max = coreTemps.max() { return max }
+        let nonHotspot = temperatures.filter { key, _ in
+            ["TC", "Tp", "Te", "Tf"].contains { key.hasPrefix($0) } && !FanControl.hotspotKeys.contains(key)
+        }.values
+        return nonHotspot.max() ?? temperatures.filter { key, _ in
+            ["TC", "Tp", "Te", "Tf"].contains { key.hasPrefix($0) }
+        }.values.max()
+    }
+
+    /// Peak of the GPU core diodes (matching Stats' "Hottest GPU").
+    public var gpuCoreMaxTemp: Float? {
+        let coreTemps = temperatures.filter { key, _ in
+            FanControl.gpuCoreKeys.contains(key)
+        }.values
+        if let max = coreTemps.max() { return max }
+        return temperatures.filter { key, _ in
+            ["TG", "Tg"].contains { key.hasPrefix($0) }
+        }.values.max()
+    }
+
+    /// Nominal peak temperature (max of CPU core max and GPU core max).
+    /// Used for steady-state fan profile curves and nominal UI display,
+    /// reflecting sustained compute load rather than transient hotspot spikes.
+    public var nominalPeakTemp: Float {
+        let cpu = cpuCoreMaxTemp ?? 0
+        let gpu = gpuCoreMaxTemp ?? 0
+        let peak = max(cpu, gpu)
+        return peak > 0 ? peak : safetyPeakTemp
+    }
+
+    /// Peak silicon hotspot temperature across CPU, GPU, and SoC junction sensors.
+    public var siliconHotspotTemp: Float {
+        let hotspotTemps = temperatures.filter { key, _ in
+            FanControl.hotspotKeys.contains(key)
+        }.values
+        return hotspotTemps.max() ?? safetyPeakTemp
+    }
+
+    /// Peak of the CPU (`TC`/`Tp`/`Te`/`Tf`) and GPU (`TG`/`Tg`) sensors including hotspots —
+    /// the temperature the thermal safety floor watches.
     public var safetyPeakTemp: Float {
         func peak(_ prefixes: [String]) -> Float {
             temperatures.filter { key, _ in prefixes.contains { key.hasPrefix($0) } }
                 .values.max() ?? 0
         }
-        return max(peak(["TC", "Tp"]), peak(["TG", "Tg"]))
+        return max(peak(["TC", "Tp", "Te", "Tf"]), peak(["TG", "Tg"]))
     }
 }
 
@@ -154,7 +197,7 @@ public final class FanControl: ThermalStatusSource {
         let supported = candidateThermalKeys.filter { connectionForProbe.getKeyInfo($0) != nil }
         self.supportedThermalKeys = supported
         self.supportedSafetyTemperatureKeys = supported.filter { key in
-            ["TC", "Tp", "TG", "Tg"].contains { key.hasPrefix($0) }
+            ["TC", "Tp", "Te", "Tf", "TG", "Tg", "TP"].contains { key.hasPrefix($0) }
         }
     }
 
@@ -374,37 +417,86 @@ public final class FanControl: ThermalStatusSource {
 
     // MARK: - Thermal Sensor Keys
 
+    // MARK: - Core Diode & Hotspot Sensor Keys (Stats-aligned)
+
+    /// Nominal CPU core diode keys across Apple Silicon generations (M1–M5) and Intel,
+    /// matching the exact keys used by the open-source Stats monitor (exelban/stats).
+    /// These measure the core center diode temperature and drive steady-state cooling curves.
+    public static let cpuCoreKeys: Set<String> = [
+        // Intel
+        "TC0D", "TC0E", "TC0F", "TC0P", "TCAD",
+        // Apple Silicon M1 (Tp09, Tp0T = E-cores; Tp01..Tp0b = P-cores)
+        "Tp09", "Tp0T",
+        "Tp01", "Tp05", "Tp0D", "Tp0H", "Tp0L", "Tp0P", "Tp0X", "Tp0b",
+        // Apple Silicon M2 (Tp1h..Tp1l = E-cores; Tp01..Tp0j = P-cores)
+        "Tp1h", "Tp1t", "Tp1p", "Tp1l",
+        "Tp0f", "Tp0j",
+        // Apple Silicon M3 (Te05..Te0S = E-cores; Tf04..Tf4E = P-cores)
+        "Te05", "Te0L", "Te0P", "Te0S",
+        "Tf04", "Tf09", "Tf0A", "Tf0B", "Tf0D", "Tf0E", "Tf44", "Tf49", "Tf4A", "Tf4B", "Tf4D", "Tf4E",
+        // Apple Silicon M4 (Te05, Te0S, Te09, Te0H = E-cores; Tp01..Tp0e = P-cores)
+        "Te09", "Te0H",
+        "Tp0V", "Tp0Y", "Tp0e",
+        // Apple Silicon M5 (Tp00..Tp0K = Super/E-cores; Tp0O..Tp0y = P-cores)
+        "Tp00", "Tp04", "Tp08", "Tp0C", "Tp0G", "Tp0K",
+        "Tp0O", "Tp0R", "Tp0U", "Tp0a", "Tp0d", "Tp0g", "Tp0m", "Tp0p", "Tp0u", "Tp0y",
+    ]
+
+    /// Nominal GPU core diode keys across Apple Silicon generations (M1–M5) and Intel/AMD,
+    /// matching the exact keys used by the Stats monitor.
+    public static let gpuCoreKeys: Set<String> = [
+        // Intel / AMD
+        "TCGC", "TG0D", "TGDD", "TG0H", "TG0P",
+        // M1
+        "Tg05", "Tg0D", "Tg0L", "Tg0T",
+        // M2
+        "Tg0f", "Tg0j",
+        // M3
+        "Tf14", "Tf18", "Tf19", "Tf1A", "Tf24", "Tf28", "Tf29", "Tf2A",
+        // M4
+        "Tg0G", "Tg0H", "Tg1U", "Tg1k", "Tg0K", "Tg0d", "Tg0e", "Tg0k",
+        // M5
+        "Tg0U", "Tg0X", "Tg0g", "Tg1Y", "Tg1c", "Tg1g",
+    ]
+
+    /// On-die silicon junction hotspots, execution unit diodes, and complex aggregates.
+    /// These are watched strictly by the thermal safety floor and emergency upper limit override.
+    public static let hotspotKeys: Set<String> = [
+        // Package & die aggregates
+        "TCDX", "TCHP", "TCMb", "TCMz",
+        // CPU core hotspot diodes (triplets)
+        "Tp02", "Tp06", "Tp0A", "Tp0E", "Tp0W", "Tp0Z", "Tp0c",
+        "Tp3P", "Tp3T", "Tp3X",
+        "Te06", "Te0A", "Te0I", "Te0T", "Te0V", "Te0X",
+        // GPU hotspots
+        "TG0B", "TG0C", "TG0V", "TG1B", "TG2B",
+        // SoC & Power delivery hotspots
+        "TPDX", "TSCD", "TVD0",
+    ]
+
     /// All thermal sensor keys probed for `status()`. Keys absent on a given machine
     /// return nil from `readTemp` and are skipped. Single source of truth so the
     /// daemon's safety floor reads exactly the CPU/GPU subset `status()` would.
-    public static let thermalKeys: [String] = [
-        // CPU — aggregate (M5 Max verified)
-        "TCDX", "TCHP", "TCMb",
-        // CPU — per-core (Tp prefix, present across M1-M5 with varying mappings)
-        "Tp01", "Tp02", "Tp03", "Tp04", "Tp05", "Tp06", "Tp07", "Tp08",
-        "Tp09", "Tp0A", "Tp0B", "Tp0C", "Tp0D", "Tp0F", "Tp0G", "Tp0H",
-        "Tp0J", "Tp0L", "Tp0P", "Tp0S", "Tp0T", "Tp0W", "Tp0X", "Tp0b",
-        // GPU (flt — M1-M4, and ioft 8-byte — M5 Max)
-        "Tg05", "Tg0D", "Tg0L", "Tg0T", "Tg0f", "Tg0j",
-        "TG0B", "TG0H", "TG0V",
-        // Memory
-        "Tm02", "Tm06", "Tm08", "Tm09", "TRDX", "TMVR",
-        // Power delivery
-        "TPDX",
-        // SSD
-        "TH0x", "TH0A", "TH0B",
-        // Ambient
-        "TAOL", "TA0P",
-        // Proximity
-        "TS0P",
-        // Battery
-        "TB0T",
-    ]
+    public static let thermalKeys: [String] = Array(
+        cpuCoreKeys
+            .union(gpuCoreKeys)
+            .union(hotspotKeys)
+            .union([
+                // Memory
+                "Tm02", "Tm06", "Tm08", "Tm09", "TRDX", "TMVR", "Tm0p", "Tm1p", "Tm2p",
+                // SSD
+                "TH0x", "TH0A", "TH0B",
+                // Ambient / Airflow / Proximity
+                "TAOL", "TA0P", "TaLP", "TaRF", "TS0P",
+                // Battery
+                "TB0T", "TB1T", "TB2T",
+            ])
+    ).sorted()
 
-    /// The CPU (TC/Tp) and GPU (TG/Tg) subset the thermal safety floor watches —
-    /// derived from `thermalKeys` so it can't drift from what `status()` reports.
+    /// The CPU, GPU, and silicon safety keys watched by the thermal safety floor —
+    /// includes both core diodes and silicon junction hotspots.
     public static let safetyTempKeys: [String] =
-        thermalKeys.filter { key in ["TC", "Tp", "TG", "Tg"].contains { key.hasPrefix($0) } }
+        thermalKeys.filter { key in ["TC", "Tp", "Te", "Tf", "TG", "Tg", "TP"].contains { key.hasPrefix($0) } }
 
     /// Thermal keys confirmed present during initialization.
     public var availableThermalKeys: [String] { supportedThermalKeys }

@@ -80,4 +80,49 @@ struct ProfileTests {
         #expect(cpu.hasUsableSafetyTemperature == true)
         #expect(empty.safetyPeakTemp == 0)
     }
+
+    @Test("Stats-aligned core diodes drive nominal peak while hotspots drive safety")
+    func coreDiodesVsHotspot() {
+        // Typical M4 sensor reading matching the Stats app
+        let m4Status = ThermalStatus(
+            fans: [],
+            temperatures: [
+                // E-cores (~61-62°C)
+                "Te05": 62.1, "Te0S": 61.1, "Te09": 62.4, "Te0H": 61.6,
+                // P-cores (~63-64°C, peak 64.0°C on Tp0V)
+                "Tp01": 63.8, "Tp05": 63.9, "Tp09": 63.8, "Tp0D": 63.3,
+                "Tp0V": 64.0, "Tp0Y": 63.9, "Tp0b": 63.4, "Tp0e": 63.2,
+                // Hotspots (78-82°C)
+                "Tp0W": 78.0, "TCMz": 82.0,
+                // GPU cores (peak 60.6°C on Tg0H)
+                "Tg0G": 55.3, "Tg0H": 60.6,
+            ]
+        )
+
+        // Core diode peak must match Stats (64.0°C)
+        #expect(m4Status.cpuCoreMaxTemp == 64.0)
+        #expect(m4Status.gpuCoreMaxTemp == 60.6)
+        #expect(m4Status.nominalPeakTemp == 64.0)
+
+        // Hotspot and safety floor must see the 82.0°C peak
+        #expect(m4Status.siliconHotspotTemp == 82.0)
+        #expect(m4Status.safetyPeakTemp == 82.0)
+        #expect(m4Status.hasUsableSafetyTemperature == true)
+    }
+
+    @Test("M3 generation sensor recognition (Te and Tf prefixes)")
+    func m3Sensors() {
+        let m3Status = ThermalStatus(
+            fans: [],
+            temperatures: [
+                "Te05": 58.0, // E-core
+                "Tf04": 66.5, // P-core
+                "Tf14": 52.0, // GPU
+            ]
+        )
+        #expect(m3Status.cpuCoreMaxTemp == 66.5)
+        #expect(m3Status.gpuCoreMaxTemp == 52.0)
+        #expect(m3Status.nominalPeakTemp == 66.5)
+        #expect(m3Status.hasUsableSafetyTemperature == true)
+    }
 }

@@ -569,12 +569,8 @@ final class AppState: ObservableObject {
                 self.usingExternalPower = monitor.usingExternalPower
                 self.smoothedPeakTemp = monitor.filteredPeakTemp
 
-                // Max of only the displayed sensors
-                // Peak across all CPU and GPU sensors for menu bar display
-                let displayPrefixes = ["TC", "Tp", "TG", "Tg"]
-                let rawMax = status.temperatures
-                    .filter { key, _ in displayPrefixes.contains(where: { key.hasPrefix($0) }) }
-                    .values.max()
+                // Peak across CPU and GPU core diodes for menu bar display (matching Stats)
+                let rawMax = status.nominalPeakTemp
 
                 if self.temperatureSmoothingEnabled, let smoothed = monitor.filteredPeakTemp {
                     self.maxTemp = smoothed
