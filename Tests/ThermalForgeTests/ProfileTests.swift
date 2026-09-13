@@ -273,4 +273,72 @@ struct ProfileTests {
         #expect(json.contains("\"silicon_hotspot\" : 82") || json.contains("\"silicon_hotspot\":82"))
         #expect(json.contains("\"nominal_peak\" : 65") || json.contains("\"nominal_peak\":65"))
     }
+
+    @Test("ThermalMonitor initializes in idle mode below customized takeover threshold and updateProfiles sets idle")
+    func monitorLowTemperatureRegime() throws {
+        let customized = FanProfile.default.withLowTempThreshold(65)
+        let source = MockLowTempStatusSource(temp: 62.0)
+        let monitor = ThermalMonitor(
+            fanControl: source,
+            profile: customized,
+            batteryProfile: customized,
+            adapterProfile: customized,
+            sensorRefreshInterval: 0.05,
+            controlLoopInterval: 0.05
+        )
+        let updates = DispatchSemaphore(value: 0)
+        let stateLock = NSLock()
+        var lastState: MonitorState?
+        monitor.onUpdate = { _, _, state in
+            stateLock.lock()
+            lastState = state
+            stateLock.unlock()
+            updates.signal()
+        }
+        monitor.start()
+        defer { monitor.stop() }
+
+        try #require(updates.wait(timeout: .now() + 2) == .success)
+        stateLock.lock()
+        let observedState1 = lastState
+        stateLock.unlock()
+        // 62°C is below the 65°C takeover threshold: state must be .idle
+        #expect(observedState1 == .idle)
+        #expect(monitor.state == .idle)
+
+        // updateProfiles should preserve/set idle state
+        let updatedProfile = FanProfile.default.withLowTempThreshold(70)
+        monitor.updateProfiles(battery: updatedProfile, adapter: updatedProfile,
+                               batteryTransform: .identity, adapterTransform: .identity)
+        try #require(updates.wait(timeout: .now() + 2) == .success)
+        stateLock.lock()
+        let observedState2 = lastState
+        stateLock.unlock()
+        #expect(observedState2 == .idle)
+        #expect(monitor.state == .idle)
+    }
+}
+
+private final class MockLowTempStatusSource: ThermalStatusSource, @unchecked Sendable {
+    private let lock = NSLock()
+    private var temp: Float
+
+    init(temp: Float) {
+        self.temp = temp
+    }
+
+    func setTemp(_ t: Float) {
+        lock.lock()
+        temp = t
+        lock.unlock()
+    }
+
+    func status() throws -> ThermalStatus {
+        lock.lock()
+        defer { lock.unlock() }
+        return ThermalStatus(
+            fans: [.init(index: 0, actualRPM: 0, targetRPM: 0, minRPM: 2000, maxRPM: 6000, mode: "auto")],
+            temperatures: ["TC0P": temp, "TG0P": 40.0]
+        )
+    }
 }

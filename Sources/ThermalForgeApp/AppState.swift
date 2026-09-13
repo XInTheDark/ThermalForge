@@ -336,8 +336,17 @@ final class AppState: ObservableObject {
                     self.monitor?.restoreSafetyLock()
                 } else if adopted == nil {
                     let restored = self.restoredProfile()
-                    self.activeProfile = restored
-                    self.monitor?.switchProfile(restored)
+                    if restored.id == FanProfile.system.id {
+                        self.activeProfile = .system
+                        self.monitor?.setManualControl(true)
+                        self.monitor?.switchProfile(.system)
+                    } else {
+                        self.monitor?.setManualControl(false)
+                        let active = (self.usingExternalPower ? self.profileForID(self.adapterProfileID) : self.profileForID(self.batteryProfileID))
+                            .withLowTempThreshold(enabled: self.lowTempRegimeEnabled, threshold: Float(self.lowTempThreshold))
+                        self.activeProfile = active
+                        self.refreshMonitorProfiles()
+                    }
                 }
                 // Ordering gate: only now that adopt has applied the launch state
                 // do we start the heartbeat. This makes adopt's externalHold write
@@ -564,12 +573,16 @@ final class AppState: ObservableObject {
     func startMonitoring() {
         guard let fc = try? FanControl() else { return }
 
+        let savedID = UserDefaults.standard.string(forKey: Self.selectedProfileKey)
+        let isSystem = (savedID == FanProfile.system.id)
+
         let batteryProf = profileForID(batteryProfileID).withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
         let adapterProf = profileForID(adapterProfileID).withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
+        let initialProf = isSystem ? .system : (usingExternalPower ? adapterProf : batteryProf)
 
         let monitor = ThermalMonitor(
             fanControl: fc,
-            profile: batteryProf,
+            profile: initialProf,
             batteryProfile: batteryProf,
             adapterProfile: adapterProf,
             batteryTransform: .identity,
@@ -583,6 +596,10 @@ final class AppState: ObservableObject {
             ),
             safetyLimitTemp: Float(safetyLimitTemp)
         )
+        if isSystem {
+            monitor.setManualControl(true)
+        }
+        self.activeProfile = initialProf
         monitor.onSafetyLimitBreached = { [weak self] sensorTemp, limitTemp in
             Task { @MainActor in
                 guard let self else { return }
@@ -681,7 +698,7 @@ final class AppState: ObservableObject {
         adapterProfileID = FanProfile.default.id
         UserDefaults.standard.set(FanProfile.default.id, forKey: "batteryProfile")
         UserDefaults.standard.set(FanProfile.default.id, forKey: "adapterProfile")
-        activeProfile = .default
+        activeProfile = FanProfile.default.withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
         monitor?.clearFaultForUserRetry()
         persistSelectedProfile(FanProfile.default.id)
         refreshMonitorProfiles()
@@ -774,7 +791,7 @@ final class AppState: ObservableObject {
         adapterProfileID = profile.id
         UserDefaults.standard.set(profile.id, forKey: "batteryProfile")
         UserDefaults.standard.set(profile.id, forKey: "adapterProfile")
-        activeProfile = profile
+        activeProfile = profile.withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
         monitor?.clearFaultForUserRetry()
         persistSelectedProfile(profile.id)
         refreshMonitorProfiles()
@@ -790,6 +807,9 @@ final class AppState: ObservableObject {
         batteryProfileID = profile.id
         UserDefaults.standard.set(profile.id, forKey: "batteryProfile")
         persistSelectedProfile(profile.id)
+        if !usingExternalPower {
+            activeProfile = profile.withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
+        }
         refreshMonitorProfiles()
     }
 
@@ -802,6 +822,9 @@ final class AppState: ObservableObject {
         adapterProfileID = profile.id
         UserDefaults.standard.set(profile.id, forKey: "adapterProfile")
         persistSelectedProfile(profile.id)
+        if usingExternalPower {
+            activeProfile = profile.withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
+        }
         refreshMonitorProfiles()
     }
 
@@ -820,7 +843,9 @@ final class AppState: ObservableObject {
     /// The profile to restore at launch: the persisted choice resolved against the known
     /// profiles, or Default when nothing is saved or the id no longer exists.
     private func restoredProfile() -> FanProfile {
-        FanProfile.selectable(id: UserDefaults.standard.string(forKey: Self.selectedProfileKey))
+        let base = FanProfile.selectable(id: UserDefaults.standard.string(forKey: Self.selectedProfileKey))
+        guard base.id != FanProfile.system.id else { return base }
+        return base.withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
     }
 
     // MARK: - Daemon recovery

@@ -266,11 +266,16 @@ public final class ThermalMonitor {
             self.adapterProfile = adapter
             self.batteryTransform = batteryTransform
             self.adapterTransform = adapterTransform
-            self.activeProfile = self.usingExternalPower ? adapter : battery
+            if !self.activeProfile.curve.handsOff {
+                self.activeProfile = self.usingExternalPower ? adapter : battery
+            }
             self.lastAppliedRPMPercent = 0
             self.fansCurrentlyRunning = false
             self.sustainedAboveCount = 0
             self.tempHistory.removeAll()
+            if self.state != .safetyOverride {
+                self.state = .idle
+            }
         }
     }
 
@@ -646,6 +651,8 @@ public final class ThermalMonitor {
                 isRampingDown = false
                 lastAppliedRPMPercent = 0
                 state = .idle
+            } else if state != .safetyOverride {
+                state = .idle
             }
             return
         }
@@ -668,6 +675,8 @@ public final class ThermalMonitor {
                 lastAppliedRPMPercent = 0
                 state = .idle
                 TFLogger.shared.fan("Fans off: \(String(format: "%.1f", peakTemp))°C below \(Int(curve.stopTemp))°C [\(activeProfile.name)]")
+            } else if state != .safetyOverride {
+                state = .idle
             }
             return
         }
@@ -676,6 +685,9 @@ public final class ThermalMonitor {
         if !fansCurrentlyRunning && sustainedAboveCount < sustainedTicksNeeded {
             if sustainedAboveCount == 1 {
                 TFLogger.shared.fan("Sustained trigger: \(String(format: "%.1f", peakTemp))°C — waiting (\(sustainedAboveCount)/\(sustainedTicksNeeded)) [\(activeProfile.name)]")
+            }
+            if state != .safetyOverride {
+                state = .idle
             }
             return
         }
