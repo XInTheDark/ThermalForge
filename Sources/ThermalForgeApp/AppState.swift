@@ -41,6 +41,31 @@ final class AppState: ObservableObject {
                                      controlLoopInterval: controlLoopInterval)
         }
     }
+    @Published var temperatureSmoothingEnabled: Bool = UserDefaults.standard.object(forKey: AppState.temperatureSmoothingKey) as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(temperatureSmoothingEnabled, forKey: Self.temperatureSmoothingKey)
+            monitor?.updateTemperatureFilter(enabled: temperatureSmoothingEnabled,
+                                             rampUpWindow: rampUpWindowSeconds,
+                                             rampDownWindow: rampDownWindowSeconds)
+        }
+    }
+    @Published var rampUpWindowSeconds: Double = UserDefaults.standard.object(forKey: AppState.rampUpWindowSecondsKey) as? Double ?? 10.0 {
+        didSet {
+            UserDefaults.standard.set(rampUpWindowSeconds, forKey: Self.rampUpWindowSecondsKey)
+            monitor?.updateTemperatureFilter(enabled: temperatureSmoothingEnabled,
+                                             rampUpWindow: rampUpWindowSeconds,
+                                             rampDownWindow: rampDownWindowSeconds)
+        }
+    }
+    @Published var rampDownWindowSeconds: Double = UserDefaults.standard.object(forKey: AppState.rampDownWindowSecondsKey) as? Double ?? 30.0 {
+        didSet {
+            UserDefaults.standard.set(rampDownWindowSeconds, forKey: Self.rampDownWindowSecondsKey)
+            monitor?.updateTemperatureFilter(enabled: temperatureSmoothingEnabled,
+                                             rampUpWindow: rampUpWindowSeconds,
+                                             rampDownWindow: rampDownWindowSeconds)
+        }
+    }
+    @Published var smoothedPeakTemp: Float?
     /// Reflects the current SMAppService login-item status so the menu toggle shows the
     /// right state. Initialized from that status as the property's DEFAULT (not reassigned
     /// in init), so `didSet` does NOT fire on launch — reading the state must never
@@ -103,15 +128,21 @@ final class AppState: ObservableObject {
 
     static let sensorRefreshIntervalKey = "sensorRefreshInterval"
     static let controlLoopIntervalKey = "controlLoopInterval"
+    static let temperatureSmoothingKey = "temperatureSmoothingEnabled"
+    static let rampUpWindowSecondsKey = "rampUpWindowSeconds"
+    static let rampDownWindowSecondsKey = "rampDownWindowSeconds"
     static let sensorRefreshOptions: [Double] = [0.5, 1.0, 2.0, 5.0]
-    static let controlLoopOptions: [Double] = [0.1, 0.25, 0.5, 1.0]
+    static let controlLoopOptions: [Double] = [0.05, 0.1, 0.25, 0.5]
 
     private static func loadInterval(key: String, fallback: Double) -> Double {
         let value = UserDefaults.standard.object(forKey: key) as? Double ?? fallback
         if key == sensorRefreshIntervalKey {
-            return sensorRefreshOptions.contains(value) ? value : fallback
+            return min(max(value, 0.5), 5.0)
         }
-        return controlLoopOptions.contains(value) ? value : fallback
+        if key == controlLoopIntervalKey {
+            return min(max(value, 0.05), 1.0)
+        }
+        return value
     }
 
     private func profileForID(_ id: String) -> FanProfile {
@@ -330,13 +361,9 @@ final class AppState: ObservableObject {
                         monitor?.suspendForEmergency(reason)
                     }
                 }
+                let wasUnreachable = self.daemonUnreachable
                 self.daemonInstalled = registered
-                if didReadState, self.externalHold == nil,
-                   self.manualRequestID == nil, !self.resettingFans,
-                   self.activeProfile.id != FanProfile.system.id,
-                   self.sensorFaultMessage == nil {
-                    monitor?.requestReapply()
-                }
+
                 // Daemon reachability — debounced so a single blip doesn't flash the
                 // "fan control unavailable" banner. Two consecutive missed heartbeats
                 // (~10s) is a real outage; any success clears it immediately.
@@ -348,6 +375,18 @@ final class AppState: ObservableObject {
                 } else if hbOK {
                     self.heartbeatFailures = 0
                     self.daemonUnreachable = false
+
+                    // If the daemon was unreachable and has now reconnected, or if the
+                    // daemon unexpectedly lost its hold while our monitor was active (e.g.
+                    // an out-of-band daemon restart), reapply the profile so fans don't stay at auto.
+                    let daemonLostHold = didReadState && self.monitorState != .idle && holdValue?.owner == "none"
+                    if (wasUnreachable || daemonLostHold),
+                       self.externalHold == nil,
+                       self.manualRequestID == nil, !self.resettingFans,
+                       self.activeProfile.id != FanProfile.system.id,
+                       self.sensorFaultMessage == nil {
+                        monitor?.requestReapply()
+                    }
                 } else {
                     self.heartbeatFailures += 1
                     if self.heartbeatFailures >= 2 { self.daemonUnreachable = true }
@@ -455,20 +494,34 @@ final class AppState: ObservableObject {
             batteryTransform: .identity,
             adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity,
             sensorRefreshInterval: sensorRefreshInterval,
-            controlLoopInterval: controlLoopInterval
+            controlLoopInterval: controlLoopInterval,
+            temperatureFilter: TemperatureFilter(
+                isEnabled: temperatureSmoothingEnabled,
+                rampUpWindowSeconds: rampUpWindowSeconds,
+                rampDownWindowSeconds: rampDownWindowSeconds
+            )
         )
         monitor.onUpdate = { [weak self] status, profile, state in
             Task { @MainActor [weak self] in
-                self?.latestStatus = status
-                self?.activeProfile = profile
-                self?.monitorState = state
-                self?.usingExternalPower = monitor.usingExternalPower
+                guard let self else { return }
+                self.latestStatus = status
+                self.activeProfile = profile
+                self.monitorState = state
+                self.usingExternalPower = monitor.usingExternalPower
+                self.smoothedPeakTemp = monitor.filteredPeakTemp
+
                 // Max of only the displayed sensors
                 // Peak across all CPU and GPU sensors for menu bar display
                 let displayPrefixes = ["TC", "Tp", "TG", "Tg"]
-                self?.maxTemp = status.temperatures
+                let rawMax = status.temperatures
                     .filter { key, _ in displayPrefixes.contains(where: { key.hasPrefix($0) }) }
                     .values.max()
+
+                if self.temperatureSmoothingEnabled, let smoothed = monitor.filteredPeakTemp {
+                    self.maxTemp = smoothed
+                } else {
+                    self.maxTemp = rawMax
+                }
             }
         }
         monitor.onPowerSourceUpdate = { [weak self] source in

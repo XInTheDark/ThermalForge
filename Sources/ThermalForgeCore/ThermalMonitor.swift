@@ -60,6 +60,8 @@ public final class ThermalMonitor {
     public private(set) var usingExternalPower = false
     public private(set) var state: MonitorState = .idle
     public private(set) var latestStatus: ThermalStatus?
+    public private(set) var filteredPeakTemp: Float?
+    public private(set) var temperatureFilter: TemperatureFilter
 
     // MARK: - Tick Timing
 
@@ -81,6 +83,7 @@ public final class ThermalMonitor {
 
     private var lastAppliedRPMPercent: Float = 0
     private var fansCurrentlyRunning = false
+    private var isRampingDown = false
     private var sustainedAboveCount = 0
     private var batteryProfile: FanProfile
     private var adapterProfile: FanProfile
@@ -133,7 +136,8 @@ public final class ThermalMonitor {
                 batteryTransform: FanPercentTransform = .identity,
                 adapterTransform: FanPercentTransform = .adapterDefault,
                 sensorRefreshInterval: TimeInterval = 1.0,
-                controlLoopInterval: TimeInterval = 0.1) {
+                controlLoopInterval: TimeInterval = 0.1,
+                temperatureFilter: TemperatureFilter = TemperatureFilter()) {
         self.fanControl = fanControl
         self.activeProfile = profile
         self.batteryProfile = batteryProfile ?? profile
@@ -142,6 +146,7 @@ public final class ThermalMonitor {
         self.adapterTransform = adapterTransform
         self.tickInterval = max(controlLoopInterval, 0.05)
         self.sensorRefreshInterval = max(sensorRefreshInterval, self.tickInterval)
+        self.temperatureFilter = temperatureFilter
     }
 
     // MARK: - Lifecycle
@@ -185,6 +190,15 @@ public final class ThermalMonitor {
         }
     }
 
+    /// Update temperature smoothing filter configuration.
+    public func updateTemperatureFilter(enabled: Bool, rampUpWindow: Double, rampDownWindow: Double) {
+        queue.async {
+            self.temperatureFilter.isEnabled = enabled
+            self.temperatureFilter.rampUpWindowSeconds = max(1.0, rampUpWindow)
+            self.temperatureFilter.rampDownWindowSeconds = max(1.0, rampDownWindow)
+        }
+    }
+
     /// Update the active profile.
     public func switchProfile(_ profile: FanProfile) {
         queue.async { [self] in
@@ -196,10 +210,12 @@ public final class ThermalMonitor {
             activeProfile = profile
             lastAppliedRPMPercent = 0
             fansCurrentlyRunning = false
+            isRampingDown = false
             sustainedAboveCount = 0
             lastMonitorUptime = nil
             lastUIUpdateUptime = nil
 
+            temperatureFilter.reset()
             tempHistory.removeAll()
             let loaded = CalibrationData.load()
             if let error = loaded?.validationError {
@@ -268,7 +284,9 @@ public final class ThermalMonitor {
             guard !faulted, !self.manualControlActive else { return }
             self.lastAppliedRPMPercent = 0
             self.fansCurrentlyRunning = false
+            self.isRampingDown = false
             self.sustainedAboveCount = 0
+            self.temperatureFilter.reset()
             self.state = .idle
         }
     }
@@ -355,6 +373,9 @@ public final class ThermalMonitor {
         // Peak CPU (TC/Tp) + GPU (TG/Tg) — the shared safety-floor sensor extraction,
         // so the client monitor and the daemon's floor read the identical value.
         let maxTemp = status.safetyPeakTemp
+        let timeConstant = isRampingDown ? temperatureFilter.rampDownWindowSeconds : temperatureFilter.rampUpWindowSeconds
+        let effectiveTemp = temperatureFilter.update(rawTemp: maxTemp, timeConstant: timeConstant, nowUptime: now)
+        filteredPeakTemp = effectiveTemp
 
         if manualControlActive, maxTemp >= FanProfile.safetyTempThreshold {
             triggerSensorFault("temperature reached the safety limit during manual testing")
@@ -397,14 +418,14 @@ public final class ThermalMonitor {
         // Sustained trigger: track consecutive ticks above start threshold.
         // Per-profile duration — converted to tick count at runtime.
         let startThreshold = activeProfile.curve.startTemp
-        if maxTemp >= startThreshold {
+        if effectiveTemp >= startThreshold {
             sustainedAboveCount += 1
         } else {
             sustainedAboveCount = 0
         }
 
         // All profiles use the same data-driven curve path.
-        tickCurve(status: status, peakTemp: maxTemp, sampleHistory: monitorDue)
+        tickCurve(status: status, peakTemp: effectiveTemp, sampleHistory: monitorDue)
 
         // UI update at slower cadence (every 500ms)
         emitUpdateIfDue(status: status, now: now)
@@ -505,6 +526,7 @@ public final class ThermalMonitor {
             if fansCurrentlyRunning {
                 applyCommand(.resetAuto)
                 fansCurrentlyRunning = false
+                isRampingDown = false
                 lastAppliedRPMPercent = 0
                 state = .idle
             }
@@ -527,6 +549,7 @@ public final class ThermalMonitor {
             if fansCurrentlyRunning {
                 applyCommand(.resetAuto)
                 fansCurrentlyRunning = false
+                isRampingDown = false
                 lastAppliedRPMPercent = 0
                 state = .idle
                 TFLogger.shared.fan("Fans off: \(String(format: "%.1f", peakTemp))°C below \(Int(curve.stopTemp))°C [\(activeProfile.name)]")
@@ -570,12 +593,14 @@ public final class ThermalMonitor {
         let rampDown = curve.rampDownPerSec * Float(tickInterval)
 
         if targetPct > lastAppliedRPMPercent {
+            isRampingDown = false
             if !curve.instantEngage {
                 // Governed ramp-up
                 targetPct = min(targetPct, lastAppliedRPMPercent + rampUp)
             }
             // instantEngage: skip governor, jump directly to target
         } else if targetPct < lastAppliedRPMPercent {
+            isRampingDown = true
             // Ramp-down governor always applies (even for instantEngage profiles)
             targetPct = max(targetPct, lastAppliedRPMPercent - rampDown)
         }

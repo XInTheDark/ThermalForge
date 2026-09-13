@@ -14,9 +14,15 @@ struct MenuBarView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Header
-            HStack {
+            HStack(spacing: 8) {
                 Text("ThermalForge")
                     .font(.headline)
+                Button(action: { PreferencesWindowController.shared.show(appState: appState) }) {
+                    Image(systemName: "gearshape")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Settings")
                 Spacer()
                 stateIndicator
             }
@@ -91,7 +97,7 @@ struct MenuBarView: View {
 
                 // Temperatures
                 SectionHeader(title: "TEMPERATURES")
-                TemperatureRow(label: "CPU", value: peakTemp(prefixes: ["TC", "Tp"]), fahrenheit: appState.useFahrenheit)
+                TemperatureRow(label: "CPU", value: appState.temperatureSmoothingEnabled ? (appState.smoothedPeakTemp ?? peakTemp(prefixes: ["TC", "Tp"])) : peakTemp(prefixes: ["TC", "Tp"]), fahrenheit: appState.useFahrenheit)
                 TemperatureRow(label: "GPU", value: peakTemp(prefixes: ["TG", "Tg"]), fahrenheit: appState.useFahrenheit)
                 TemperatureRow(label: "RAM", value: peakTemp(prefixes: ["TR", "Tm", "TM"]), fahrenheit: appState.useFahrenheit)
                 TemperatureRow(label: "SSD", value: peakTemp(prefixes: ["TH"]), fahrenheit: appState.useFahrenheit)
@@ -172,36 +178,24 @@ struct MenuBarView: View {
             Divider().padding(.vertical, 4)
 
             // Footer
-            SectionHeader(title: "REFRESH")
-            Picker("Sensors", selection: $appState.sensorRefreshInterval) {
-                ForEach(AppState.sensorRefreshOptions, id: \.self) { interval in
-                    Text(formatInterval(interval)).tag(interval)
+            HStack {
+                Button(action: { PreferencesWindowController.shared.show(appState: appState) }) {
+                    Label("Settings...", systemImage: "gearshape")
                 }
-            }
-            .pickerStyle(.menu)
-            .padding(.horizontal, 12)
-            Picker("Control loop", selection: $appState.controlLoopInterval) {
-                ForEach(AppState.controlLoopOptions, id: \.self) { interval in
-                    Text(formatInterval(interval)).tag(interval)
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+
+                Spacer()
+
+                Button(action: { NSApp.terminate(nil) }) {
+                    Text("Quit")
                 }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
             }
-            .pickerStyle(.menu)
-            .padding(.horizontal, 12)
-
-            Divider().padding(.vertical, 4)
-            Toggle("°F / °C", isOn: $appState.useFahrenheit)
-                .padding(.horizontal, 12)
-            Toggle("Launch at Login", isOn: $appState.launchAtLogin)
-                .padding(.horizontal, 12)
-
-            Button(action: { NSApp.terminate(nil) }) {
-                Text("Quit ThermalForge")
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
             .padding(.horizontal, 12)
             .padding(.top, 4)
-            .padding(.bottom, 10)
+            .padding(.bottom, 8)
         }
         .frame(width: 260)
     }
@@ -236,15 +230,6 @@ struct MenuBarView: View {
         guard let temps = appState.latestStatus?.temperatures else { return nil }
         let values = temps.filter { key, _ in prefixes.contains(where: { key.hasPrefix($0) }) }.values
         return values.max()
-    }
-
-    private func formatInterval(_ interval: Double) -> String {
-        if interval < 1 {
-            return "\(Int(interval * 1000)) ms"
-        }
-        return interval == floor(interval)
-            ? "\(Int(interval)) s"
-            : "\(String(format: "%.1f", interval)) s"
     }
 }
 
