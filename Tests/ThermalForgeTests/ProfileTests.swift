@@ -69,4 +69,13 @@ struct ProfileTests {
         #expect(transform.apply(to: 0.99) == 1)
         #expect(FanPercentTransform.identity.apply(to: 0.42) == 0.42)
     }
+
+    @Test("An empty thermal snapshot is not treated as a safe low temperature")
+    func missingSafetySensor() {
+        let empty = ThermalStatus(fans: [], temperatures: [:])
+        let cpu = ThermalStatus(fans: [], temperatures: ["TC0P": 55])
+        #expect(empty.hasUsableSafetyTemperature == false)
+        #expect(cpu.hasUsableSafetyTemperature == true)
+        #expect(empty.safetyPeakTemp == 0)
+    }
 }

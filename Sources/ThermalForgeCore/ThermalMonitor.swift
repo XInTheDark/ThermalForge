@@ -52,6 +52,9 @@ public final class ThermalMonitor {
     private let fanControl: FanControl
     private var timer: DispatchSourceTimer?
     private let queue = DispatchQueue(label: "com.thermalforge.monitor")
+    private let healthLock = NSLock()
+    private var lastSuccessfulTickUptime: UInt64?
+    private var sensorFaultLatched = false
 
     public private(set) var activeProfile: FanProfile
     public private(set) var usingExternalPower = false
@@ -117,6 +120,7 @@ public final class ThermalMonitor {
     /// Called on UI update cadence (every 500ms) with updated status
     public var onUpdate: ((ThermalStatus, FanProfile, MonitorState) -> Void)?
     public var onPowerSourceUpdate: ((PowerSourceState) -> Void)?
+    public var onSensorFault: ((String) -> Void)?
     /// Called when a fan command needs to be executed (may require privilege)
     public var onFanCommand: ((FanCommand) throws -> Void)?
 
@@ -148,6 +152,9 @@ public final class ThermalMonitor {
         lastSensorReadUptime = nil
         lastMonitorUptime = nil
         lastUIUpdateUptime = nil
+        healthLock.lock()
+        lastSuccessfulTickUptime = nil
+        healthLock.unlock()
 
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now(), repeating: tickInterval)
@@ -178,6 +185,10 @@ public final class ThermalMonitor {
     /// Update the active profile.
     public func switchProfile(_ profile: FanProfile) {
         queue.async { [self] in
+            healthLock.lock()
+            sensorFaultLatched = false
+            lastSuccessfulTickUptime = nil
+            healthLock.unlock()
             activeProfile = profile
             lastAppliedRPMPercent = 0
             fansCurrentlyRunning = false
@@ -228,14 +239,85 @@ public final class ThermalMonitor {
         }
     }
 
+    /// Reapply the active profile after the daemon has restarted and lost its
+    /// in-memory hold record. This is never used after an emergency latch.
+    public func requestReapply() {
+        queue.async {
+            self.healthLock.lock()
+            let faulted = self.sensorFaultLatched
+            self.healthLock.unlock()
+            guard !faulted else { return }
+            self.lastAppliedRPMPercent = 0
+            self.fansCurrentlyRunning = false
+            self.sustainedAboveCount = 0
+            self.state = .idle
+        }
+    }
+
+    /// The app heartbeat uses this to prove that the control loop itself is still
+    /// making progress. A healthy daemon connection alone is insufficient.
+    public func hasRecentControlTick(within interval: TimeInterval = 3) -> Bool {
+        healthLock.lock()
+        defer { healthLock.unlock() }
+        guard !sensorFaultLatched, let last = lastSuccessfulTickUptime else { return false }
+        let now = DispatchTime.now().uptimeNanoseconds
+        return TimeInterval(now - last) / 1_000_000_000 <= interval
+    }
+
+    /// Latch control off immediately when another subsystem detects that the
+    /// monitor is no longer trustworthy. The latch is cleared only by explicit
+    /// user profile selection.
+    public func suspendForEmergency(_ reason: String) {
+        healthLock.lock()
+        guard !sensorFaultLatched else {
+            healthLock.unlock()
+            return
+        }
+        sensorFaultLatched = true
+        lastSuccessfulTickUptime = nil
+        healthLock.unlock()
+        TFLogger.shared.error("Thermal control suspended: \(reason)")
+        onSensorFault?(reason)
+        applyCommand(.resetAuto)
+    }
+
+    private func triggerSensorFault(_ reason: String) {
+        suspendForEmergency(reason)
+        state = .idle
+    }
+
+    /// Explicit user action to retry after a sensor/control fault.
+    public func clearFaultForUserRetry() {
+        queue.async {
+            self.healthLock.lock()
+            self.sensorFaultLatched = false
+            self.lastSuccessfulTickUptime = nil
+            self.healthLock.unlock()
+            self.state = .idle
+        }
+    }
+
+    /// Stop automatic control after a fan write failed. The app reports this to
+    /// the user; no further profile commands are attempted until an explicit retry.
+    public func notifyCommandFailure(_ reason: String = "fan command failed") {
+        queue.async { self.triggerSensorFault(reason) }
+    }
+
     // MARK: - Polling
 
     private func tick() {
+        healthLock.lock()
+        let faulted = sensorFaultLatched
+        healthLock.unlock()
+        if faulted { return }
         let now = DispatchTime.now().uptimeNanoseconds
         let sensorDue = cachedStatus == nil || elapsedSince(lastSensorReadUptime, now) >= sensorRefreshInterval
         let status: ThermalStatus
         if sensorDue {
-            guard let fresh = try? fanControl.status() else { return }
+            guard let fresh = try? fanControl.status() else {
+                triggerSensorFault("sensor snapshot failed")
+                return
+            }
             cachedStatus = fresh
             lastSensorReadUptime = now
             status = fresh
@@ -245,6 +327,11 @@ public final class ThermalMonitor {
             status = cachedStatus
         }
         latestStatus = status
+
+        guard status.hasUsableSafetyTemperature else {
+            triggerSensorFault("no usable CPU/GPU safety sensor was reported")
+            return
+        }
 
         // Peak CPU (TC/Tp) + GPU (TG/Tg) — the shared safety-floor sensor extraction,
         // so the client monitor and the daemon's floor read the identical value.
@@ -266,6 +353,7 @@ public final class ThermalMonitor {
                 TFLogger.shared.safety("Override triggered: \(String(format: "%.1f", maxTemp))°C — fans maxed")
             }
             emitUpdateIfDue(status: status, now: now)
+            markControlTickHealthy(now)
             return
         }
 
@@ -290,6 +378,13 @@ public final class ThermalMonitor {
 
         // UI update at slower cadence (every 500ms)
         emitUpdateIfDue(status: status, now: now)
+        markControlTickHealthy(now)
+    }
+
+    private func markControlTickHealthy(_ now: UInt64) {
+        healthLock.lock()
+        lastSuccessfulTickUptime = now
+        healthLock.unlock()
     }
 
     private func elapsedSince(_ previous: UInt64?, _ now: UInt64) -> TimeInterval {

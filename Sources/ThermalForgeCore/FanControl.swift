@@ -59,6 +59,12 @@ public struct ThermalStatus: Encodable {
 }
 
 extension ThermalStatus {
+    public var hasUsableSafetyTemperature: Bool {
+        temperatures.keys.contains { key in
+            ["TC", "Tp", "TG", "Tg"].contains { key.hasPrefix($0) }
+        }
+    }
+
     /// Peak of the CPU (`TC`/`Tp`) and GPU (`TG`/`Tg`) sensors — the temperature the
     /// thermal safety floor watches. Single source of truth so the client
     /// `ThermalMonitor` and the daemon's floor read the identical value; mirroring

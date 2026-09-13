@@ -365,6 +365,13 @@ public final class DaemonServer {
     public func run() {
         NSLog("ThermalForge daemon: listening on %@", ThermalForgeDaemon.socketPath)
 
+        // A daemon restart loses its in-memory hold record. Start from Apple Auto
+        // so a stale manual RPM can never survive an unexpected daemon crash.
+        smcLock.lock()
+        let resetOK = (try? fanControl.resetAuto()) != nil
+        smcLock.unlock()
+        NSLog("ThermalForge daemon: startup fan reset %@", resetOK ? "succeeded" : "failed")
+
         // Watch for sleep/wake to re-apply fan settings
         registerWakeNotification()
 
@@ -567,7 +574,19 @@ public final class DaemonServer {
 
         guard suspended || heldCommand != nil else { return }
 
-        guard let temp = currentSafetyTemp() else { return }
+        guard let temp = currentSafetyTemp() else {
+            // A held manual setting without a readable safety sensor is not safe
+            // to maintain. Return control to macOS instead of guessing a temperature.
+            smcLock.lock()
+            try? fanControl.resetAuto()
+            smcLock.unlock()
+            stateLock.lock()
+            hold = .none
+            safetySuspended = false
+            stateLock.unlock()
+            NSLog("ThermalForge daemon: safety sensor unavailable — reset fans to auto")
+            return
+        }
 
         switch thermalFloor.evaluate(temp: temp, holdCommand: heldCommand, suspended: suspended) {
         case .none:

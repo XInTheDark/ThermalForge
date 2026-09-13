@@ -26,6 +26,11 @@ struct MenuBarView: View {
 
             Divider()
 
+            if let sensorFault = appState.sensorFaultMessage {
+                SensorFaultBanner(reason: sensorFault)
+                Divider()
+            }
+
             if appState.daemonInstalled == false {
                 DaemonInstallBanner(onInstall: { appState.installDaemon() })
                 Divider()
@@ -281,6 +286,26 @@ private struct FanCurvePreview: View {
 }
 
 // MARK: - Subviews
+
+private struct SensorFaultBanner: View {
+    let reason: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("Thermal monitoring stopped", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption.bold())
+                .foregroundStyle(.red)
+            Text("ThermalForge handed fan control back to macOS because \(reason). It will stay in Apple Auto until you choose a profile again.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.red.opacity(0.12))
+    }
+}
 
 /// Banner shown when a hold was set from the CLI. Explains what's pinned and how
 /// to release it without needing to know any terminal commands.

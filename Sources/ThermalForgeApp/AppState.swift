@@ -64,6 +64,9 @@ final class AppState: ObservableObject {
     /// without the daemon the app can't control fans at all, so this must be
     /// visible, not just logged. Cleared the moment a heartbeat succeeds.
     @Published var daemonUnreachable: Bool = false
+    /// Set when the monitor loses its required thermal sensors. Control is handed
+    /// back to macOS and remains there until the user explicitly retries a profile.
+    @Published var sensorFaultMessage: String?
     /// Whether launchd has the ThermalForge daemon registered. Nil means the
     /// first background check has not completed yet.
     @Published var daemonInstalled: Bool?
@@ -128,6 +131,9 @@ final class AppState: ObservableObject {
                     Task { @MainActor in self?.externalHold = state }
                 } else {
                     TFLogger.shared.error("Fan command failed: \(command) — \(error)")
+                    Task { @MainActor in
+                        self?.monitor?.notifyCommandFailure("a fan command could not be applied")
+                    }
                 }
                 return false
             }
@@ -235,6 +241,7 @@ final class AppState: ObservableObject {
 
     private func startHeartbeat() {
         let client = DaemonClient()
+        let monitor = self.monitor
         let timer = DispatchSource.makeTimerSource(queue: heartbeatQueue)
         timer.schedule(deadline: .now() + 5, repeating: 5)
         timer.setEventHandler { [weak self] in
@@ -245,8 +252,12 @@ final class AppState: ObservableObject {
             // liveness and the daemon watchdog reverts after 15s of silence. One
             // immediate retry absorbs a transient blip without waiting a full 5s
             // for the next tick.
-            let firstBeat = (try? client.request(DaemonRequest(verb: .heartbeat)))?.ok == true
-            let hbOK = firstBeat || ((try? client.request(DaemonRequest(verb: .heartbeat)))?.ok == true)
+            let loopHealthy = monitor?.hasRecentControlTick() ?? false
+            if !loopHealthy {
+                monitor?.suspendForEmergency("the control loop stopped responding")
+            }
+            let firstBeat = loopHealthy && (try? client.request(DaemonRequest(verb: .heartbeat)))?.ok == true
+            let hbOK = firstBeat || (loopHealthy && ((try? client.request(DaemonRequest(verb: .heartbeat)))?.ok == true))
             let registered = ThermalForgeDaemon.isRegisteredWithLaunchd
 
             // Advisory: version + state. On failure/timeout DON'T assert — leave
@@ -289,10 +300,19 @@ final class AppState: ObservableObject {
                 if didReadVersion { self.daemonVersionMismatch = versionValue }
                 if didReadState { self.externalHold = holdValue }
                 self.daemonInstalled = registered
+                if didReadState, holdValue == nil,
+                   self.activeProfile.id != FanProfile.system.id,
+                   self.sensorFaultMessage == nil {
+                    monitor?.requestReapply()
+                }
                 // Daemon reachability — debounced so a single blip doesn't flash the
                 // "fan control unavailable" banner. Two consecutive missed heartbeats
                 // (~10s) is a real outage; any success clears it immediately.
-                if hbOK {
+                if !loopHealthy {
+                    self.sensorFaultMessage = self.sensorFaultMessage ?? "the control loop stopped responding"
+                    self.activeProfile = .system
+                    self.heartbeatFailures = 0
+                } else if hbOK {
                     self.heartbeatFailures = 0
                     self.daemonUnreachable = false
                 } else {
@@ -423,6 +443,13 @@ final class AppState: ObservableObject {
                 self?.usingExternalPower = source == .external
             }
         }
+        monitor.onSensorFault = { [weak self] reason in
+            Task { @MainActor in
+                self?.sensorFaultMessage = reason
+                self?.monitorState = .idle
+                self?.activeProfile = .system
+            }
+        }
         monitor.onFanCommand = { [weak self] command in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -455,11 +482,13 @@ final class AppState: ObservableObject {
 
     func setDefault() {
         let took = seizeControl()
+        sensorFaultMessage = nil
         batteryProfileID = FanProfile.default.id
         adapterProfileID = FanProfile.default.id
         UserDefaults.standard.set(FanProfile.default.id, forKey: "batteryProfile")
         UserDefaults.standard.set(FanProfile.default.id, forKey: "adapterProfile")
         activeProfile = .default
+        monitor?.clearFaultForUserRetry()
         persistSelectedProfile(FanProfile.default.id)
         monitor?.updateProfiles(battery: .default, adapter: .default,
                                 batteryTransform: .identity, adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity)
@@ -496,11 +525,13 @@ final class AppState: ObservableObject {
 
     func selectProfile(_ profile: FanProfile) {
         let took = seizeControl()
+        sensorFaultMessage = nil
         batteryProfileID = profile.id
         adapterProfileID = profile.id
         UserDefaults.standard.set(profile.id, forKey: "batteryProfile")
         UserDefaults.standard.set(profile.id, forKey: "adapterProfile")
         activeProfile = profile
+        monitor?.clearFaultForUserRetry()
         persistSelectedProfile(profile.id)
         monitor?.updateProfiles(battery: profile, adapter: profile,
                                 batteryTransform: .identity, adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity)
@@ -516,6 +547,8 @@ final class AppState: ObservableObject {
     }
 
     func selectBatteryProfile(_ profile: FanProfile) {
+        sensorFaultMessage = nil
+        monitor?.clearFaultForUserRetry()
         batteryProfileID = profile.id
         UserDefaults.standard.set(profile.id, forKey: "batteryProfile")
         persistSelectedProfile(profile.id)
@@ -524,6 +557,8 @@ final class AppState: ObservableObject {
     }
 
     func selectAdapterProfile(_ profile: FanProfile) {
+        sensorFaultMessage = nil
+        monitor?.clearFaultForUserRetry()
         adapterProfileID = profile.id
         UserDefaults.standard.set(profile.id, forKey: "adapterProfile")
         monitor?.updateProfiles(battery: profileForID(batteryProfileID), adapter: profile,
