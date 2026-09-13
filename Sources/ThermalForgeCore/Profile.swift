@@ -274,12 +274,34 @@ extension FanProfile {
         curve: Curve(stopTemp: 55, startTemp: 60, ceilingTemp: 92,
                      maxRPMPercent: 1.0, curveShape: .sCurve,
                      rampUpPerSec: 0.12, rampDownPerSec: 0.05,
-                     sustainedTriggerSec: 2, rateOfChangeBoost: 0.15)
+                     sustainedTriggerSec: 5, rateOfChangeBoost: 0.15)
+    )
+
+    /// Quiet profile: starts later and suppresses low/mid fan speeds for acoustic comfort,
+    /// while preserving full cooling capacity at high heat to prevent thermal throttling.
+    public static let silent = FanProfile(
+        id: "silent",
+        name: "Silent",
+        curve: Curve(stopTemp: 65, startTemp: 70, ceilingTemp: 96,
+                     maxRPMPercent: 1.0, curveShape: .easeIn,
+                     rampUpPerSec: 0.04, rampDownPerSec: 0.02,
+                     sustainedTriggerSec: 10, rateOfChangeBoost: 0)
+    )
+
+    /// High-performance profile: borderline of diminishing returns without blasting at idle,
+    /// starting at 58°C and hitting full speed by 86°C to maximize sustained clocks.
+    public static let aggressive = FanProfile(
+        id: "aggressive",
+        name: "Aggressive",
+        curve: Curve(stopTemp: 53, startTemp: 58, ceilingTemp: 86,
+                     maxRPMPercent: 1.0, curveShape: .sCurve,
+                     rampUpPerSec: 0.18, rampDownPerSec: 0.04,
+                     sustainedTriggerSec: 2.5, rateOfChangeBoost: 0.22)
     )
 
     /// Central registry for profiles shown in the app and accepted by the CLI.
     /// Add a profile here; no profile-specific monitor branch is needed.
-    public static let available: [FanProfile] = [`default`]
+    public static let available: [FanProfile] = [`default`, silent, aggressive]
     public static let builtIn: [FanProfile] = available
 
     /// A return-to-system mode, kept separate from the fork's profile registry.

@@ -4,11 +4,16 @@ import Testing
 
 @Suite("Profiles")
 struct ProfileTests {
-    @Test("Default is the only selectable built-in and legacy ids migrate")
+    @Test("Built-in profiles are registered and obsolete legacy ids migrate")
     func registryAndMigration() {
-        #expect(FanProfile.available.count == 1)
-        #expect(FanProfile.available.first?.id == "default")
-        for id in [nil, "default", "smart", "silent", "balanced", "performance", "max", "removed"] {
+        #expect(FanProfile.available.count == 3)
+        #expect(FanProfile.available.map(\.id) == ["default", "silent", "aggressive"])
+        #expect(FanProfile.selectable(id: nil).id == "default")
+        #expect(FanProfile.selectable(id: "default").id == "default")
+        #expect(FanProfile.selectable(id: "silent").id == "silent")
+        #expect(FanProfile.selectable(id: "aggressive").id == "aggressive")
+        #expect(FanProfile.selectable(id: "system").id == "system")
+        for id in ["smart", "balanced", "performance", "max", "removed", "unknown"] {
             #expect(FanProfile.selectable(id: id).id == "default")
         }
     }
@@ -22,8 +27,74 @@ struct ProfileTests {
         #expect(profile.curve.ceilingTemp == 92)
         #expect(profile.curve.maxRPMPercent == 1)
         #expect(profile.curve.curveShape == .sCurve)
-        #expect(profile.curve.sustainedTriggerSec == 2)
+        #expect(profile.curve.sustainedTriggerSec == 5)
         #expect(profile.curve.rateOfChangeBoost == 0.15)
+    }
+
+    @Test("Silent profile prioritizes acoustic comfort and smooth transitions")
+    func silentCurve() {
+        let profile = FanProfile.silent
+        #expect(profile.name == "Silent")
+        #expect(profile.curve.stopTemp == 65)
+        #expect(profile.curve.startTemp == 70)
+        #expect(profile.curve.ceilingTemp == 96)
+        #expect(profile.curve.maxRPMPercent == 1)
+        #expect(profile.curve.curveShape == .easeIn)
+        #expect(profile.curve.sustainedTriggerSec == 10)
+        #expect(profile.curve.rampUpPerSec == 0.04)
+        #expect(profile.curve.rampDownPerSec == 0.02)
+        #expect(profile.curve.rateOfChangeBoost == 0)
+
+        let curve = profile.curve
+        // Fans stay off below 70°C
+        #expect(curve.displayPercent(at: 65) == 0)
+        #expect(curve.displayPercent(at: 70) == 0)
+        #expect(curve.targetPercent(at: 65, fansCurrentlyRunning: false) == nil)
+        #expect(curve.targetPercent(at: 68, fansCurrentlyRunning: true) == 0.001)
+
+        // Suppressed low-mid range via easeIn (pos^2)
+        // At 75°C: pos = (75 - 70) / (96 - 70) = 5 / 26 ≈ 0.1923; pos^2 ≈ 0.037
+        #expect(curve.displayPercent(at: 75) < 0.05)
+        // At 83°C: pos = 13 / 26 = 0.5; pos^2 = 0.25
+        #expect(abs(curve.displayPercent(at: 83) - 0.25) < 0.01)
+
+        // Full cooling at ceiling
+        #expect(curve.displayPercent(at: 96) == 1.0)
+        #expect(curve.targetPercent(at: 96, fansCurrentlyRunning: true) == 1.0)
+    }
+
+    @Test("Aggressive profile reaches ceiling early for sustained performance")
+    func aggressiveCurve() {
+        let profile = FanProfile.aggressive
+        #expect(profile.name == "Aggressive")
+        #expect(profile.curve.stopTemp == 53)
+        #expect(profile.curve.startTemp == 58)
+        #expect(profile.curve.ceilingTemp == 86)
+        #expect(profile.curve.maxRPMPercent == 1)
+        #expect(profile.curve.curveShape == .sCurve)
+        #expect(profile.curve.sustainedTriggerSec == 2.5)
+        #expect(profile.curve.rampUpPerSec == 0.18)
+        #expect(profile.curve.rampDownPerSec == 0.04)
+        #expect(profile.curve.rateOfChangeBoost == 0.22)
+
+        let curve = profile.curve
+        // Off below 55°C (does not blast fans at 55°C)
+        #expect(curve.targetPercent(at: 53, fansCurrentlyRunning: false) == nil)
+        #expect(curve.targetPercent(at: 55, fansCurrentlyRunning: false) == nil)
+        #expect(curve.displayPercent(at: 55) == 0)
+
+        // Engages at 58°C
+        #expect(curve.displayPercent(at: 58) == 0)
+
+        // Mid-point at 72°C: pos = 14 / 28 = 0.5; s-curve(0.5) = 0.50
+        #expect(abs(curve.displayPercent(at: 72) - 0.50) < 0.01)
+
+        // High cooling early: at 79°C pos = 21 / 28 = 0.75, s-curve(0.75) ≈ 0.844
+        #expect(curve.displayPercent(at: 79) > 0.80)
+
+        // Full speed at 86°C
+        #expect(curve.displayPercent(at: 86) == 1.0)
+        #expect(curve.targetPercent(at: 86, fansCurrentlyRunning: true) == 1.0)
     }
 
     @Test("Curve math handles hysteresis and display preview")
