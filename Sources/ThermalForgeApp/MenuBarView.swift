@@ -73,12 +73,19 @@ struct MenuBarView: View {
                         Text("Fan \(fan.index)")
                             .foregroundStyle(.secondary)
                         Spacer()
+                        Text(fan.actualPercent.map { "\($0)%" } ?? "—")
+                            .font(.system(.body, design: .monospaced))
+                            .help("Actual RPM within this fan's minimum-to-maximum range.")
                         Text("\(fan.actualRPM) RPM")
                             .font(.system(.body, design: .monospaced))
+                            .foregroundStyle(.secondary)
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 1)
                 }
+
+                ManualFanControlView()
+                    .padding(.horizontal, 12)
 
                 Divider().padding(.vertical, 4)
 
@@ -150,11 +157,13 @@ struct MenuBarView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
+                .disabled(appState.resettingFans)
                 Button(action: { appState.resetAuto() }) {
                     Label("Apple Auto", systemImage: "arrow.counterclockwise")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
+                .disabled(appState.resettingFans)
             }
             .padding(.horizontal, 12)
             Toggle("Adapter cooling boost", isOn: $appState.adapterBoostEnabled)
@@ -201,19 +210,25 @@ struct MenuBarView: View {
 
     @ViewBuilder
     private var stateIndicator: some View {
-        switch appState.monitorState {
-        case .safetyOverride:
-            Label("SAFETY", systemImage: "exclamationmark.triangle.fill")
-                .font(.caption)
-                .foregroundStyle(.red)
-        case .active(let name):
-            Label(name, systemImage: "fan.fill")
+        if appState.manualAppliedPercent != nil {
+            Label("Manual", systemImage: "hand.raised.fill")
                 .font(.caption)
                 .foregroundStyle(.orange)
-        case .idle:
-            Label("Idle", systemImage: "fan")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        } else {
+            switch appState.monitorState {
+            case .safetyOverride:
+                Label("SAFETY", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            case .active(let name):
+                Label(name, systemImage: "fan.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            case .idle:
+                Label("Idle", systemImage: "fan")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -230,6 +245,57 @@ struct MenuBarView: View {
         return interval == floor(interval)
             ? "\(Int(interval)) s"
             : "\(String(format: "%.1f", interval)) s"
+    }
+}
+
+private struct ManualFanControlView: View {
+    @EnvironmentObject private var appState: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Manual fan test")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if let applied = appState.manualAppliedPercent {
+                    Text("Active · \(Int(applied))%")
+                        .font(.caption2.bold())
+                        .foregroundStyle(.orange)
+                }
+            }
+
+            HStack(spacing: 8) {
+                Slider(value: Binding(
+                    get: { appState.manualFanPercent },
+                    set: { appState.manualFanPercent = $0.rounded() }
+                ), in: 0...100)
+                    .accessibilityLabel("Manual fan target")
+                    .accessibilityValue("\(Int(appState.manualFanPercent)) percent")
+                Text("\(Int(appState.manualFanPercent.rounded()))%")
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(width: 34, alignment: .trailing)
+                Button(appState.manualApplyInProgress ? "Applying…" : "Apply") {
+                    appState.applyManualFanPercent(appState.manualFanPercent)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(!appState.canApplyManualControl)
+            }
+
+            Text("0% is minimum speed. Apple Auto releases control.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let error = appState.manualControlError {
+                Text(error)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.top, 2)
     }
 }
 

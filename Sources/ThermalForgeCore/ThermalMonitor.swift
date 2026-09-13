@@ -49,7 +49,7 @@ public enum MonitorState: Equatable {
 // MARK: - Thermal Monitor
 
 public final class ThermalMonitor {
-    private let fanControl: FanControl
+    private let fanControl: ThermalStatusSource
     private var timer: DispatchSourceTimer?
     private let queue = DispatchQueue(label: "com.thermalforge.monitor")
     private let healthLock = NSLock()
@@ -86,6 +86,9 @@ public final class ThermalMonitor {
     private var adapterProfile: FanProfile
     private var batteryTransform: FanPercentTransform
     private var adapterTransform: FanPercentTransform
+    /// Manual test control pauses profile writes while keeping sensor reads,
+    /// health tracking, and emergency handback active.
+    private var manualControlActive = false
 
     // MARK: - Temperature History
 
@@ -124,7 +127,7 @@ public final class ThermalMonitor {
     /// Called when a fan command needs to be executed (may require privilege)
     public var onFanCommand: ((FanCommand) throws -> Void)?
 
-    public init(fanControl: FanControl, profile: FanProfile = .default,
+    public init(fanControl: ThermalStatusSource, profile: FanProfile = .default,
                 batteryProfile: FanProfile? = nil,
                 adapterProfile: FanProfile? = nil,
                 batteryTransform: FanPercentTransform = .identity,
@@ -185,6 +188,7 @@ public final class ThermalMonitor {
     /// Update the active profile.
     public func switchProfile(_ profile: FanProfile) {
         queue.async { [self] in
+            manualControlActive = false
             healthLock.lock()
             sensorFaultLatched = false
             lastSuccessfulTickUptime = nil
@@ -239,6 +243,21 @@ public final class ThermalMonitor {
         }
     }
 
+    /// Pause/resume automatic profile writes for the app's explicit manual test
+    /// control. This is serialized with the control queue.
+    public func setManualControl(_ active: Bool, onReady: (@Sendable () -> Void)? = nil) {
+        queue.async {
+            self.manualControlActive = active
+            onReady?()
+        }
+    }
+
+    public var isControlFaultLatched: Bool {
+        healthLock.lock()
+        defer { healthLock.unlock() }
+        return sensorFaultLatched
+    }
+
     /// Reapply the active profile after the daemon has restarted and lost its
     /// in-memory hold record. This is never used after an emergency latch.
     public func requestReapply() {
@@ -246,7 +265,7 @@ public final class ThermalMonitor {
             self.healthLock.lock()
             let faulted = self.sensorFaultLatched
             self.healthLock.unlock()
-            guard !faulted else { return }
+            guard !faulted, !self.manualControlActive else { return }
             self.lastAppliedRPMPercent = 0
             self.fansCurrentlyRunning = false
             self.sustainedAboveCount = 0
@@ -337,6 +356,11 @@ public final class ThermalMonitor {
         // so the client monitor and the daemon's floor read the identical value.
         let maxTemp = status.safetyPeakTemp
 
+        if manualControlActive, maxTemp >= FanProfile.safetyTempThreshold {
+            triggerSensorFault("temperature reached the safety limit during manual testing")
+            return
+        }
+
         let monitorDue = elapsedSince(lastMonitorUptime, now) >= Self.monitorInterval
         if monitorDue {
             monitorTick(status: status, maxTemp: maxTemp)
@@ -362,6 +386,12 @@ public final class ThermalMonitor {
             && maxTemp < FanProfile.safetyTempThreshold - FanProfile.hysteresisDegrees
         {
             state = .idle
+        }
+
+        if manualControlActive {
+            emitUpdateIfDue(status: status, now: now)
+            markControlTickHealthy(now)
+            return
         }
 
         // Sustained trigger: track consecutive ticks above start threshold.

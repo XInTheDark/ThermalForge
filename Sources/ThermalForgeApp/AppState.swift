@@ -67,6 +67,16 @@ final class AppState: ObservableObject {
     /// Set when the monitor loses its required thermal sensors. Control is handed
     /// back to macOS and remains there until the user explicitly retries a profile.
     @Published var sensorFaultMessage: String?
+    /// Draft value for the explicit manual fan test control.
+    @Published var manualFanPercent: Double = 50
+    /// Confirmed target, separate from the draft slider and the SMC manual mode
+    /// (automatic profiles also use that hardware mode).
+    @Published private(set) var manualAppliedPercent: Double?
+    @Published private(set) var manualApplyInProgress = false
+    @Published private(set) var resettingFans = false
+    @Published var manualControlError: String?
+    private var manualRequestID: UUID?
+    private var manualAppliedAt: UInt64?
     /// Whether launchd has the ThermalForge daemon registered. Nil means the
     /// first background check has not completed yet.
     @Published var daemonInstalled: Bool?
@@ -81,6 +91,15 @@ final class AppState: ObservableObject {
     private var heartbeatTimer: DispatchSourceTimer?
     /// Consecutive failed heartbeats, for debouncing `daemonUnreachable`.
     private var heartbeatFailures = 0
+
+    var canApplyManualControl: Bool {
+        !manualApplyInProgress && !resettingFans && !daemonUnreachable &&
+        daemonInstalled == true && externalHold == nil && sensorFaultMessage == nil &&
+        monitor?.hasRecentControlTick() == true &&
+        latestStatus?.hasUsableSafetyTemperature == true &&
+        (latestStatus?.safetyPeakTemp ?? .infinity) < FanProfile.safetyTempThreshold &&
+        latestStatus?.manualFanCommands(forPercent: manualFanPercent) != nil
+    }
 
     static let sensorRefreshIntervalKey = "sensorRefreshInterval"
     static let controlLoopIntervalKey = "controlLoopInterval"
@@ -287,8 +306,9 @@ final class AppState: ObservableObject {
             // as-is (don't clear a reflected CLI hold on a transient failure).
             let didReadState: Bool
             let holdValue: DaemonHoldState?
+            let stateReadStarted = DispatchTime.now().uptimeNanoseconds
             if let hold = try? client.readState() {
-                holdValue = hold.isCLIHold ? hold : nil
+                holdValue = hold
                 didReadState = true
             } else {
                 holdValue = nil
@@ -298,9 +318,21 @@ final class AppState: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if didReadVersion { self.daemonVersionMismatch = versionValue }
-                if didReadState { self.externalHold = holdValue }
+                if didReadState {
+                    self.externalHold = holdValue?.isCLIHold == true ? holdValue : nil
+                    if let appliedAt = self.manualAppliedAt,
+                       stateReadStarted >= appliedAt, holdValue?.owner != "app" {
+                        // A confirmed release ends the test. Leave the monitor
+                        // latched off; never resume a profile after this handback.
+                        let reason = "the background service released manual fan control"
+                        self.sensorFaultMessage = reason
+                        self.clearManualControl()
+                        monitor?.suspendForEmergency(reason)
+                    }
+                }
                 self.daemonInstalled = registered
-                if didReadState, holdValue == nil,
+                if didReadState, self.externalHold == nil,
+                   self.manualRequestID == nil, !self.resettingFans,
                    self.activeProfile.id != FanProfile.system.id,
                    self.sensorFaultMessage == nil {
                     monitor?.requestReapply()
@@ -311,6 +343,7 @@ final class AppState: ObservableObject {
                 if !loopHealthy {
                     self.sensorFaultMessage = self.sensorFaultMessage ?? "the control loop stopped responding"
                     self.activeProfile = .system
+                    self.clearManualControl()
                     self.heartbeatFailures = 0
                 } else if hbOK {
                     self.heartbeatFailures = 0
@@ -448,6 +481,7 @@ final class AppState: ObservableObject {
                 self?.sensorFaultMessage = reason
                 self?.monitorState = .idle
                 self?.activeProfile = .system
+                self?.clearManualControl()
             }
         }
         monitor.onFanCommand = { [weak self] command in
@@ -457,6 +491,14 @@ final class AppState: ObservableObject {
                 // the main actor where externalHold lives; the monitor resumes
                 // control when they pick a profile or press Default.
                 guard self.externalHold == nil else { return }
+                // A profile tick can already be queued on the main actor when
+                // Apply is clicked. Drop it while testing or releasing control.
+                // The emergency reset must always be allowed through.
+                if self.monitor?.isControlFaultLatched == true {
+                    guard command == .resetAuto else { return }
+                } else if self.manualRequestID != nil || self.resettingFans {
+                    return
+                }
                 // Hand off to the coalescing pump; the blocking socket write happens
                 // OFF the main thread. During a ramp these fire up to ~10x/sec;
                 // previously each ran a blocking round-trip on the main actor and
@@ -470,19 +512,30 @@ final class AppState: ObservableObject {
 
     // MARK: - Actions
 
-    /// Explicit user takeover of any reflected CLI hold. Returns whether one was
-    /// active, so the caller can clear the daemon's unsupervised hold (send a
-    /// command) rather than leave it orphaned.
+    /// Invalidate pending manual commands and release any manual or CLI hold
+    /// before an explicit profile selection resumes automatic control.
     @discardableResult
     private func seizeControl() -> Bool {
-        let had = externalHold != nil
+        let had = externalHold != nil || manualRequestID != nil
         externalHold = nil
+        clearManualControl()
         return had
     }
 
+    private func clearManualControl() {
+        manualRequestID = nil
+        manualAppliedPercent = nil
+        manualAppliedAt = nil
+        manualApplyInProgress = false
+        manualControlError = nil
+    }
+
     func setDefault() {
+        guard !resettingFans else { return }
         let took = seizeControl()
         sensorFaultMessage = nil
+        if took { commandPump.submit(.resetAuto) }
+        monitor?.setManualControl(false)
         batteryProfileID = FanProfile.default.id
         adapterProfileID = FanProfile.default.id
         UserDefaults.standard.set(FanProfile.default.id, forKey: "batteryProfile")
@@ -492,23 +545,22 @@ final class AppState: ObservableObject {
         persistSelectedProfile(FanProfile.default.id)
         monitor?.updateProfiles(battery: .default, adapter: .default,
                                 batteryTransform: .identity, adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity)
-        // Taking over a CLI hold: clear it so the unsupervised hold isn't
-        // orphaned; the Default curve then establishes supervised control. Off-main
-        // one-shot on the pump (never coalesced/reordered).
-        if took { commandPump.submit(.resetAuto) }
         TFLogger.shared.profile("Default profile activated")
     }
 
     func resetAuto() {
+        guard !resettingFans else { return }
+        resettingFans = true
         seizeControl()
+        monitor?.setManualControl(true)
         // resetAuto clears any hold (CLI or app) → daemon .none. This is the
         // no-CLI-knowledge escape from a pinned hold and returns control to macOS.
         // Send the reset off-main and reflect Apple Auto ONLY once the daemon confirms;
-        // on failure, leave the current profile active (so the monitor keeps trying)
-        // and log it, rather than a false "Apple Auto, handled" over a dead daemon.
+        // On failure the command pump enters the emergency latch.
         commandPump.submit(.resetAuto) { [weak self] ok in
             Task { @MainActor in
                 guard let self else { return }
+                self.resettingFans = false
                 guard ok else {
                     TFLogger.shared.error("Reset to Apple Auto failed — daemon unreachable; fans NOT reset")
                     return
@@ -523,9 +575,61 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Apply the slider's draft value only after an explicit button click.
+    /// Automatic profile writes are paused after the click, while the monitor's
+    /// sensor health checks and emergency handback continue to run.
+    func applyManualFanPercent(_ percent: Double) {
+        guard canApplyManualControl,
+              let commands = latestStatus?.manualFanCommands(forPercent: percent) else {
+            manualControlError = "Manual control is unavailable. Check the status above."
+            return
+        }
+
+        let target = min(max(percent, 0), 100)
+        let requestID = UUID()
+        manualRequestID = requestID
+        manualApplyInProgress = true
+        manualAppliedAt = nil
+        manualControlError = nil
+        monitor?.setManualControl(true) { [weak self] in
+            Task { @MainActor in
+                self?.applyManualCommands(commands[...], percent: target, requestID: requestID)
+            }
+        }
+    }
+
+    /// Advance only after each fan accepts its target. A fault, Apple Auto, or
+    /// profile selection invalidates the request before another fan can be set.
+    private func applyManualCommands(_ commands: ArraySlice<FanCommand>, percent: Double, requestID: UUID) {
+        guard manualRequestID == requestID,
+              monitor?.isControlFaultLatched == false else { return }
+        guard let command = commands.first else {
+            manualAppliedPercent = percent
+            manualApplyInProgress = false
+            manualAppliedAt = DispatchTime.now().uptimeNanoseconds
+            TFLogger.shared.profile("Manual fan test applied: \(Int(percent))%")
+            return
+        }
+        commandPump.submit(command) { [weak self] ok in
+            Task { @MainActor in
+                guard let self, self.manualRequestID == requestID else { return }
+                guard ok else {
+                    self.clearManualControl()
+                    self.manualControlError = "The manual fan command was not applied. Check the status above."
+                    self.monitor?.suspendForEmergency("a manual fan command could not be applied")
+                    return
+                }
+                self.applyManualCommands(commands.dropFirst(), percent: percent, requestID: requestID)
+            }
+        }
+    }
+
     func selectProfile(_ profile: FanProfile) {
+        guard !resettingFans else { return }
         let took = seizeControl()
         sensorFaultMessage = nil
+        if profile.curve.handsOff || took { commandPump.submit(.resetAuto) }
+        monitor?.setManualControl(false)
         batteryProfileID = profile.id
         adapterProfileID = profile.id
         UserDefaults.standard.set(profile.id, forKey: "batteryProfile")
@@ -536,18 +640,13 @@ final class AppState: ObservableObject {
         monitor?.updateProfiles(battery: profile, adapter: profile,
                                 batteryTransform: .identity, adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity)
         TFLogger.shared.profile("Selected: \(profile.name)")
-
-        // Reset to auto when switching to a hands-off profile, OR when taking over
-        // a CLI hold (so its unsupervised hold isn't orphaned). Otherwise active
-        // profiles let tick() ramp from the current temperature. Off-main one-shot
-        // on the pump (never coalesced/reordered).
-        if profile.curve.handsOff || took {
-            commandPump.submit(.resetAuto)
-        }
     }
 
     func selectBatteryProfile(_ profile: FanProfile) {
+        guard !resettingFans else { return }
+        if seizeControl() { commandPump.submit(.resetAuto) }
         sensorFaultMessage = nil
+        monitor?.setManualControl(false)
         monitor?.clearFaultForUserRetry()
         batteryProfileID = profile.id
         UserDefaults.standard.set(profile.id, forKey: "batteryProfile")
@@ -557,7 +656,10 @@ final class AppState: ObservableObject {
     }
 
     func selectAdapterProfile(_ profile: FanProfile) {
+        guard !resettingFans else { return }
+        if seizeControl() { commandPump.submit(.resetAuto) }
         sensorFaultMessage = nil
+        monitor?.setManualControl(false)
         monitor?.clearFaultForUserRetry()
         adapterProfileID = profile.id
         UserDefaults.standard.set(profile.id, forKey: "adapterProfile")

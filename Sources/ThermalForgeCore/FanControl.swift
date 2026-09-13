@@ -59,6 +59,17 @@ public struct ThermalStatus: Encodable {
 }
 
 extension ThermalStatus {
+    /// Each fan uses its own hardware range. Zero means minimum RPM, not off.
+    public func manualFanCommands(forPercent percent: Double) -> [FanCommand]? {
+        guard percent.isFinite, !fans.isEmpty,
+              fans.allSatisfy(\.hasUsableRPMLimits) else { return nil }
+        let fraction = min(max(percent, 0), 100) / 100
+        return fans.map { fan in
+            let rpm = Double(fan.minRPM) + (Double(fan.maxRPM) - Double(fan.minRPM)) * fraction
+            return .setFan(index: fan.index, rpm: Float(rpm.rounded()))
+        }
+    }
+
     public var hasUsableSafetyTemperature: Bool {
         temperatures.keys.contains { key in
             ["TC", "Tp", "TG", "Tg"].contains { key.hasPrefix($0) }
@@ -78,6 +89,19 @@ extension ThermalStatus {
     }
 }
 
+extension ThermalStatus.FanStatus {
+    public var hasUsableRPMLimits: Bool {
+        (0...9).contains(index) && minRPM >= 0 && maxRPM > minRPM
+    }
+
+    /// Actual speed in the same minimum-to-maximum range used by manual control.
+    public var actualPercent: Int? {
+        guard hasUsableRPMLimits, actualRPM >= 0 else { return nil }
+        let fraction = (Double(actualRPM) - Double(minRPM)) / (Double(maxRPM) - Double(minRPM))
+        return Int((min(max(fraction, 0), 1) * 100).rounded())
+    }
+}
+
 public struct DiscoveredKey {
     public let key: String
     public let size: UInt32
@@ -87,7 +111,11 @@ public struct DiscoveredKey {
 
 // MARK: - Fan Control
 
-public final class FanControl {
+public protocol ThermalStatusSource {
+    func status() throws -> ThermalStatus
+}
+
+public final class FanControl: ThermalStatusSource {
     private let smc: SMCConnection
     /// Which mode key works on this hardware (detected at init)
     private let modeKeyTemplate: String

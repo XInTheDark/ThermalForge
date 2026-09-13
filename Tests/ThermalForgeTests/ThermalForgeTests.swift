@@ -97,3 +97,42 @@ struct FanKeyTests {
         #expect(SMCFanKey.forceTest == "Ftst")
     }
 }
+
+@Suite("Fan status display and manual targets")
+struct FanStatusTests {
+    @Test("Manual percentage uses each fan's own RPM limits")
+    func percentageAndPerFanRPM() {
+        let status = ThermalStatus(fans: [
+            .init(index: 0, actualRPM: 3500, targetRPM: 3500, minRPM: 2000, maxRPM: 8000, mode: "manual"),
+            .init(index: 1, actualRPM: 3000, targetRPM: 3000, minRPM: 2500, maxRPM: 7500, mode: "manual"),
+        ], temperatures: ["TC0P": 50])
+
+        #expect(status.fans[0].actualPercent == 25)
+        #expect(status.fans[1].actualPercent == 10)
+        #expect(status.manualFanCommands(forPercent: 50) == [.setFan(index: 0, rpm: 5000), .setFan(index: 1, rpm: 5000)])
+        #expect(status.manualFanCommands(forPercent: -10) == [.setFan(index: 0, rpm: 2000), .setFan(index: 1, rpm: 2500)])
+        #expect(status.manualFanCommands(forPercent: 110) == [.setFan(index: 0, rpm: 8000), .setFan(index: 1, rpm: 7500)])
+        #expect(status.manualFanCommands(forPercent: .nan) == nil)
+        #expect(status.manualFanCommands(forPercent: .infinity) == nil)
+    }
+
+    @Test("Missing fan limits prevent manual control and show an unknown percentage")
+    func invalidFanLimits() {
+        let unknown = ThermalStatus.FanStatus(index: 1, actualRPM: 2500, targetRPM: 2500,
+                                             minRPM: 2000, maxRPM: 0, mode: "auto")
+        let valid = ThermalStatus.FanStatus(index: 0, actualRPM: 5000, targetRPM: 5000,
+                                           minRPM: 2000, maxRPM: 8000, mode: "auto")
+        #expect(unknown.actualPercent == nil)
+        #expect(ThermalStatus(fans: [valid, unknown], temperatures: [:]).manualFanCommands(forPercent: 50) == nil)
+        #expect(ThermalStatus(fans: [], temperatures: [:]).manualFanCommands(forPercent: 50) == nil)
+    }
+
+    @Test("Stopped fans and tachometer overshoot stay within zero to 100 percent")
+    func actualPercentClamps() {
+        for (rpm, expected) in [(0, 0), (2000, 0), (5000, 50), (8000, 100), (8100, 100)] {
+            let fan = ThermalStatus.FanStatus(index: 0, actualRPM: rpm, targetRPM: 5000,
+                                             minRPM: 2000, maxRPM: 8000, mode: "auto")
+            #expect(fan.actualPercent == expected)
+        }
+    }
+}
