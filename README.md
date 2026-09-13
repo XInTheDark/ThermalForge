@@ -58,11 +58,13 @@ Tools like **Macs Fan Control** and **TG Pro** charge $15–$20 for fan control 
 
 ## Profiles
 
-ThermalForge currently ships one starting profile, **Default**. It is a heuristic starting point rather than a claim about every Mac's ideal calibration. The curve is intentionally system-like and smooth, but starts earlier, reaches 100% at a lower temperature, and responds to a rapid temperature rise so sustained workloads spend less time near throttling temperatures.
+ThermalForge ships three starting profiles. They are heuristic starting points rather than claims about every Mac's ideal calibration. Default is proactive and smooth, Aggressive starts cooling earlier, and Silent starts later with an ease-in curve that keeps low and mid fan speeds gentler.
 
 | Profile | Fans off | Fans start | Ceiling | Max fan | Curve | Sustained trigger | Behavior |
 |---|---:|---:|---:|---:|---|---:|---|
-| **Default** | 50°C | 53°C | 80°C | 100% | S-curve | 2 seconds | Proactive ramp with a modest rising-temperature boost. |
+| **Default** | 50°C | 55°C | 92°C | 100% | S-curve | 5 seconds | Proactive ramp with a modest rising-temperature boost. |
+| **Silent** | 60°C | 65°C | 96°C | 100% | Ease-in | 10 seconds | Gentler low/mid response for acoustic comfort. |
+| **Aggressive** | 45°C | 50°C | 86°C | 100% | S-curve | 2.5 seconds | Earlier, faster response for sustained performance. |
 
 The menu bar app draws the same curve math used by the controller. It labels the approximate start and 100% temperatures; live output can differ because of hysteresis, the sustained trigger, ramp limits, fan minimum RPM, and optional machine calibration.
 
@@ -123,7 +125,7 @@ ThermalForge controls fans through a background daemon, and 0.2.0 locks down how
 
 ## Default profile
 
-The Default profile is this fork's opinionated starting point: keep the familiar smooth system response while trading some acoustics for thermal headroom. It starts around 53°C, reaches full target around 80°C, waits about two seconds of sustained heat before engaging, and adds a small boost when temperature is rising quickly. Calibration data, when present and valid, supplies the machine-specific base target while these safeguards still apply.
+The Default profile is this fork's opinionated starting point: keep the familiar smooth system response while trading some acoustics for thermal headroom. It starts around 55°C, reaches full target at 92°C, waits about five seconds of sustained heat before engaging, and adds a small boost when temperature is rising quickly. Calibration data, when present and valid, supplies the machine-specific base target while these safeguards still apply.
 
 The curve is intentionally a heuristic. Apple Silicon models, workloads, ambient temperature, and fan hardware differ, so treat the displayed graph as an estimate and adjust the refresh settings or future profile values after observing your machine.
 

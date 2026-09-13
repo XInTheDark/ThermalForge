@@ -617,9 +617,8 @@ public final class ThermalMonitor {
             return 0
         }
 
-        let minRPM = status.fans.first.map { Float($0.minRPM) } ?? 2317
-        let maxRPM = status.fans.first.map { Float($0.maxRPM) } ?? 7826
-        var targetPct = curveTarget <= 0.001 ? minRPM / maxRPM : curveTarget
+        // 0.001 is the hysteresis sentinel signaling "maintain minimum controllable speed" (0%)
+        var targetPct = curveTarget <= 0.001 ? 0 : curveTarget
 
         if let calibrated = calibration?.fanPercentForTemp(peakTemp) { targetPct = calibrated }
         if targetPct > 0, curve.rateOfChangeBoost > 0 {
@@ -640,8 +639,12 @@ public final class ThermalMonitor {
 
     private func tickCurve(status: ThermalStatus, peakTemp: Float, sampleHistory: Bool) {
         let curve = activeProfile.curve
-        let maxRPM = status.fans.first.map { Float($0.maxRPM) } ?? 7826
-        let minRPM = status.fans.first.map { Float($0.minRPM) } ?? 2317
+        let minRPM = status.fans.map { Float($0.minRPM) }.filter { $0 > 0 }.max()
+            ?? status.fans.first.map { Float($0.minRPM) }
+            ?? 2317
+        let maxRPM = status.fans.map { Float($0.maxRPM) }.filter { $0 > 0 }.min()
+            ?? status.fans.first.map { Float($0.maxRPM) }
+            ?? 7826
 
         // Hands-off profiles: don't control fans, just monitor
         if curve.handsOff {
@@ -693,7 +696,7 @@ public final class ThermalMonitor {
         }
 
         var targetPct = calculateProfileTargetPercent(status: status, peakTemp: peakTemp)
-        targetPct = min(max(targetPct, minRPM / maxRPM), curve.maxRPMPercent)
+        targetPct = min(max(targetPct, 0), curve.maxRPMPercent)
 
         // Ramp governors — per-profile rates, per-tick amounts
         let rampUp = curve.rampUpPerSec * Float(tickInterval)
@@ -712,9 +715,9 @@ public final class ThermalMonitor {
             targetPct = max(targetPct, lastAppliedRPMPercent - rampDown)
         }
 
-        // Apply if changed meaningfully (threshold scaled for 100ms ticks)
-        if abs(targetPct - lastAppliedRPMPercent) > 0.002 {
-            let targetRPM = max(maxRPM * targetPct, minRPM)
+        // Apply if changed meaningfully (threshold scaled for 100ms ticks) or engaging for the first time
+        if !fansCurrentlyRunning || abs(targetPct - lastAppliedRPMPercent) > 0.002 {
+            let targetRPM = max(maxRPM * targetPct, minRPM).rounded()
             applyCommand(.setRPM(targetRPM))
 
             if !fansCurrentlyRunning {

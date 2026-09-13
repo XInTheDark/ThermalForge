@@ -55,7 +55,7 @@ struct UpperLimitFallbackTests {
         let initialStatus = createStatus(maxTemp: 105.0)
         let mockSource = MockThermalStatusSource(mockedStatus: initialStatus)
 
-        // Curve with ceiling at 80, but at 60C it commands ~0.3 (30%)
+        // The safety check must dominate even when the profile target is low.
         let monitor = ThermalMonitor(
             fanControl: mockSource,
             profile: FanProfile.default,
@@ -74,7 +74,7 @@ struct UpperLimitFallbackTests {
             appliedCommands.append(cmd)
         }
 
-        // Target calculation for 60°C is ~0.3
+        // Target calculation for 60°C is 0.0 (minimum controllable fan speed)
         let targetAt60 = monitor.calculateProfileTargetPercent(status: initialStatus, peakTemp: 60.0)
         #expect(targetAt60 < 0.90) // delta = 1.0 - targetAt60 > 0.10
 
