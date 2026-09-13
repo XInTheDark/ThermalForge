@@ -18,6 +18,20 @@ final class AppState: ObservableObject {
     @Published var useFahrenheit: Bool = UserDefaults.standard.bool(forKey: "useFahrenheit") {
         didSet { UserDefaults.standard.set(useFahrenheit, forKey: "useFahrenheit") }
     }
+    @Published var sensorRefreshInterval: Double = AppState.loadInterval(key: AppState.sensorRefreshIntervalKey, fallback: 1.0) {
+        didSet {
+            UserDefaults.standard.set(sensorRefreshInterval, forKey: Self.sensorRefreshIntervalKey)
+            monitor?.updateIntervals(sensorRefreshInterval: sensorRefreshInterval,
+                                     controlLoopInterval: controlLoopInterval)
+        }
+    }
+    @Published var controlLoopInterval: Double = AppState.loadInterval(key: AppState.controlLoopIntervalKey, fallback: 0.1) {
+        didSet {
+            UserDefaults.standard.set(controlLoopInterval, forKey: Self.controlLoopIntervalKey)
+            monitor?.updateIntervals(sensorRefreshInterval: sensorRefreshInterval,
+                                     controlLoopInterval: controlLoopInterval)
+        }
+    }
     /// Reflects the current SMAppService login-item status so the menu toggle shows the
     /// right state. Initialized from that status as the property's DEFAULT (not reassigned
     /// in init), so `didSet` does NOT fire on launch — reading the state must never
@@ -41,6 +55,9 @@ final class AppState: ObservableObject {
     /// without the daemon the app can't control fans at all, so this must be
     /// visible, not just logged. Cleared the moment a heartbeat succeeds.
     @Published var daemonUnreachable: Bool = false
+    /// Whether launchd has the ThermalForge daemon registered. Nil means the
+    /// first background check has not completed yet.
+    @Published var daemonInstalled: Bool?
     /// A GitHub release newer than this installed build, else nil. Non-nil drives
     /// the "Update available" banner. Set from a once-daily check and from persisted
     /// state on launch (so it shows without waiting for a network round-trip); a
@@ -52,6 +69,19 @@ final class AppState: ObservableObject {
     private var heartbeatTimer: DispatchSourceTimer?
     /// Consecutive failed heartbeats, for debouncing `daemonUnreachable`.
     private var heartbeatFailures = 0
+
+    static let sensorRefreshIntervalKey = "sensorRefreshInterval"
+    static let controlLoopIntervalKey = "controlLoopInterval"
+    static let sensorRefreshOptions: [Double] = [0.5, 1.0, 2.0, 5.0]
+    static let controlLoopOptions: [Double] = [0.1, 0.25, 0.5, 1.0]
+
+    private static func loadInterval(key: String, fallback: Double) -> Double {
+        let value = UserDefaults.standard.object(forKey: key) as? Double ?? fallback
+        if key == sensorRefreshIntervalKey {
+            return sensorRefreshOptions.contains(value) ? value : fallback
+        }
+        return controlLoopOptions.contains(value) ? value : fallback
+    }
 
     /// Runs the 5s heartbeat/version/state polls OFF the main thread so a slow
     /// or hung daemon can never stall the UI run loop (the v0.1.7 freeze).
@@ -197,6 +227,7 @@ final class AppState: ObservableObject {
             // for the next tick.
             let firstBeat = (try? client.request(DaemonRequest(verb: .heartbeat)))?.ok == true
             let hbOK = firstBeat || ((try? client.request(DaemonRequest(verb: .heartbeat)))?.ok == true)
+            let registered = ThermalForgeDaemon.isRegisteredWithLaunchd
 
             // Advisory: version + state. On failure/timeout DON'T assert — leave
             // the last known value untouched rather than clearing the banner on a
@@ -237,6 +268,7 @@ final class AppState: ObservableObject {
                 guard let self else { return }
                 if didReadVersion { self.daemonVersionMismatch = versionValue }
                 if didReadState { self.externalHold = holdValue }
+                self.daemonInstalled = registered
                 // Daemon reachability — debounced so a single blip doesn't flash the
                 // "fan control unavailable" banner. Two consecutive missed heartbeats
                 // (~10s) is a real outage; any success clears it immediately.
@@ -342,7 +374,12 @@ final class AppState: ObservableObject {
     func startMonitoring() {
         guard let fc = try? FanControl() else { return }
 
-        let monitor = ThermalMonitor(fanControl: fc, profile: activeProfile)
+        let monitor = ThermalMonitor(
+            fanControl: fc,
+            profile: activeProfile,
+            sensorRefreshInterval: sensorRefreshInterval,
+            controlLoopInterval: controlLoopInterval
+        )
         monitor.onUpdate = { [weak self] status, profile, state in
             Task { @MainActor [weak self] in
                 self?.latestStatus = status
@@ -489,6 +526,48 @@ final class AppState: ObservableObject {
                 TFLogger.shared.error("Restart daemon failed to launch: \(error)")
             }
         }
+    }
+
+    /// Install the bundled CLI as the privileged launchd daemon. Authentication
+    /// is handled by macOS; the app never receives or stores the password.
+    func installDaemon() {
+        guard let cli = daemonCLIPath() else {
+            TFLogger.shared.error("Daemon install unavailable — no bundled or installed CLI found")
+            return
+        }
+        let command = "\(shellQuote(cli)) install"
+        let escaped = command.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let script = "do shell script \"\(escaped)\" with administrator privileges"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            p.arguments = ["-e", script]
+            do {
+                try p.run()
+                p.waitUntilExit()
+                if p.terminationStatus == 0 {
+                    TFLogger.shared.info("Daemon install requested")
+                } else {
+                    TFLogger.shared.error("Daemon install failed (osascript exit \(p.terminationStatus))")
+                }
+            } catch {
+                TFLogger.shared.error("Daemon install failed to launch: \(error)")
+            }
+        }
+    }
+
+    private func daemonCLIPath() -> String? {
+        let candidates = [
+            Bundle.main.url(forResource: "thermalforge", withExtension: nil)?.path,
+            "/usr/local/bin/thermalforge",
+            "/opt/homebrew/bin/thermalforge",
+        ].compactMap { $0 }
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     // MARK: - Launch at Login

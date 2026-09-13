@@ -58,7 +58,7 @@ Tools like **Macs Fan Control** and **TG Pro** charge $15–$20 for fan control 
 
 Every profile uses a proportional curve with a per-profile curve shape — fans ramp gradually with temperature, not as binary switches. All profiles share a unified 50°C off threshold (matching Apple's observed behavior). Each profile has its own sustained trigger duration — fans only engage after temperature stays above the start threshold for a profile-specific number of seconds, filtering transient spikes that resolve on their own. Reacting to transient spikes would cause the start/stop cycling that is the #1 cause of fan bearing wear (source: [Analog Devices fan control](https://www.analog.com/en/analog-dialogue/articles/how-to-control-fan-speed.html)).
 
-Thermal polling runs at 100ms (matching Apple's own thermalmonitord cadence) for smooth fan transitions. Each profile has its own ramp rates and curve shape tuned to its purpose. Ramp governor design sourced from [MAX31760 datasheet](https://www.analog.com/media/en/technical-documentation/data-sheets/max31760.pdf) and [Microchip AN771](https://ww1.microchip.com/downloads/en/appnotes/00771a.pdf).
+The fan control loop runs at 100ms by default; the full SMC sensor snapshot runs every 1 second by default and only reads keys found during startup. Both intervals can be changed in the app under **REFRESH**. The expensive full snapshot is reused between samples to keep idle CPU and power low. Each profile has its own ramp rates and curve shape tuned to its purpose. Ramp governor design sourced from [MAX31760 datasheet](https://www.analog.com/media/en/technical-documentation/data-sheets/max31760.pdf) and [Microchip AN771](https://ww1.microchip.com/downloads/en/appnotes/00771a.pdf).
 
 | Profile | Fans off | Fans start | Ceiling | Max fan | Curve | Sustained trigger | Behavior |
 |---|---|---|---|---|---|---|---|
@@ -91,13 +91,18 @@ Homebrew requires third-party taps to be trusted before it will run their formul
 
 ### Option B: From source
 
+For local use without an Apple Developer account, build an ad hoc signed app bundle:
+
 ```bash
 git clone https://github.com/ProducerGuy/ThermalForge.git
 cd ThermalForge
-./setup.sh
+./Scripts/build_local.sh
+open ./dist/ThermalForge.app
 ```
 
-Builds everything, installs the CLI, creates the menu bar app in `/Applications`, and sets up the daemon. One password prompt, fully automatic.
+The script builds the release CLI and menu bar app, embeds a copy of the CLI for the app’s one-click daemon installer, assembles `dist/ThermalForge.app`, removes quarantine attributes, and signs the bundle with an ad hoc identity (`-`). This is suitable for the Mac where it was built; it is not a distribution or notarization workflow. If the daemon is missing, the app shows an **Install Service** button that opens the normal macOS administrator prompt. You can also install it from Terminal with `sudo ./dist/thermalforge install`.
+
+Use `./setup.sh` when you want the CLI, daemon, and app installed into system locations; it requires one administrator password prompt.
 
 ### After install
 

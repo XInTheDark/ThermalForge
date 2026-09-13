@@ -26,7 +26,10 @@ struct MenuBarView: View {
 
             Divider()
 
-            if appState.daemonUnreachable {
+            if appState.daemonInstalled == false {
+                DaemonInstallBanner(onInstall: { appState.installDaemon() })
+                Divider()
+            } else if appState.daemonUnreachable {
                 // Daemon not answering — nothing in the app can touch the fans, so
                 // this takes over the top of the menu and offers a one-click fix.
                 // The version/hold banners are moot while it's unreachable.
@@ -166,6 +169,23 @@ struct MenuBarView: View {
             Divider().padding(.vertical, 4)
 
             // Footer
+            SectionHeader(title: "REFRESH")
+            Picker("Sensors", selection: $appState.sensorRefreshInterval) {
+                ForEach(AppState.sensorRefreshOptions, id: \.self) { interval in
+                    Text(formatInterval(interval)).tag(interval)
+                }
+            }
+            .pickerStyle(.menu)
+            .padding(.horizontal, 12)
+            Picker("Control loop", selection: $appState.controlLoopInterval) {
+                ForEach(AppState.controlLoopOptions, id: \.self) { interval in
+                    Text(formatInterval(interval)).tag(interval)
+                }
+            }
+            .pickerStyle(.menu)
+            .padding(.horizontal, 12)
+
+            Divider().padding(.vertical, 4)
             Toggle("°F / °C", isOn: $appState.useFahrenheit)
                 .padding(.horizontal, 12)
             Toggle("Launch at Login", isOn: $appState.launchAtLogin)
@@ -207,6 +227,15 @@ struct MenuBarView: View {
         guard let temps = appState.latestStatus?.temperatures else { return nil }
         let values = temps.filter { key, _ in prefixes.contains(where: { key.hasPrefix($0) }) }.values
         return values.max()
+    }
+
+    private func formatInterval(_ interval: Double) -> String {
+        if interval < 1 {
+            return "\(Int(interval * 1000)) ms"
+        }
+        return interval == floor(interval)
+            ? "\(Int(interval)) s"
+            : "\(String(format: "%.1f", interval)) s"
     }
 }
 
@@ -286,6 +315,29 @@ private struct DaemonUpdateBanner: View {
                 .padding(.horizontal, 6)
                 .padding(.vertical, 3)
                 .background(RoundedRectangle(cornerRadius: 4).fill(Color.secondary.opacity(0.15)))
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12))
+    }
+}
+
+private struct DaemonInstallBanner: View {
+    let onInstall: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("Fan control needs setup", systemImage: "lock.shield")
+                .font(.caption.bold())
+                .foregroundStyle(.orange)
+            Text("Install the background service once to control fans without repeated password prompts.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Install Service", action: onInstall)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)

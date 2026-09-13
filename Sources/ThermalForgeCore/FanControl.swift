@@ -15,6 +15,7 @@ public enum ThermalForgeError: Error, CustomStringConvertible {
     case readFailed(String)
     case writeFailed(String)
     case rpmOutOfRange(requested: Float, min: Float, max: Float)
+    case invalidFan(index: Int)
 
     public var description: String {
         switch self {
@@ -28,6 +29,8 @@ public enum ThermalForgeError: Error, CustomStringConvertible {
             return "Failed to write SMC key: \(key). Run with sudo."
         case .rpmOutOfRange(let req, let min, let max):
             return "RPM \(Int(req)) is out of range [\(Int(min))–\(Int(max))]"
+        case .invalidFan(let index):
+            return "Invalid fan index: \(index)"
         }
     }
 }
@@ -84,6 +87,11 @@ public final class FanControl {
     private let modeKeyTemplate: String
     /// Whether Ftst unlock is available (M1-M4) or not (M5+)
     private let hasFtst: Bool
+    /// Thermal keys present on this machine. SMC key availability is stable for
+    /// the lifetime of a boot, so probe the candidate list once instead of
+    /// repeatedly asking the SMC about absent keys on every status read.
+    private let supportedThermalKeys: [String]
+    private let supportedSafetyTemperatureKeys: [String]
 
     public init() throws {
         guard let connection = SMCConnection() else {
@@ -106,6 +114,14 @@ public final class FanControl {
         } else {
             self.hasFtst = false
         }
+
+        let candidateThermalKeys = FanControl.thermalKeys
+        let connectionForProbe = connection
+        let supported = candidateThermalKeys.filter { connectionForProbe.getKeyInfo($0) != nil }
+        self.supportedThermalKeys = supported
+        self.supportedSafetyTemperatureKeys = supported.filter { key in
+            ["TC", "Tp", "TG", "Tg"].contains { key.hasPrefix($0) }
+        }
     }
 
     // MARK: - Fan Count
@@ -115,12 +131,22 @@ public final class FanControl {
         guard result.success, !result.bytes.isEmpty else {
             throw ThermalForgeError.readFailed(SMCFanKey.count)
         }
-        return Int(result.bytes[0])
+        let count = Int(result.bytes[0])
+        guard (1...10).contains(count) else {
+            throw ThermalForgeError.readFailed("\(SMCFanKey.count) returned invalid fan count \(count)")
+        }
+        return count
     }
 
     // MARK: - Read Fan Info
 
     public func fanInfo(_ index: Int) throws -> FanInfo {
+        // SMC fan keys are exactly four characters (F0Ac … F9Ac). Validate the
+        // index before formatting so malformed CLI input becomes an error rather
+        // than tripping SMCConnection's key-length precondition.
+        guard (0...9).contains(index) else {
+            throw ThermalForgeError.invalidFan(index: index)
+        }
         let actual = readFanFloat(index, template: SMCFanKey.actual)
         let target = readFanFloat(index, template: SMCFanKey.target)
         let minimum = readFanFloat(index, template: SMCFanKey.minimum)
@@ -262,17 +288,21 @@ public final class FanControl {
     /// Set all fans to a specific RPM
     public func setAllFans(rpm: Float) throws {
         let count = try fanCount()
+        let infos = try (0..<count).map { try fanInfo($0) }
 
-        // Validate against first fan's limits
-        let info = try fanInfo(0)
-        if info.minRPM > 0 && rpm < info.minRPM {
+        // Every fan must accept the shared target. Validating only fan 0 can
+        // produce a partial write or an internal failure when another fan has
+        // a higher minimum or lower maximum.
+        let minimum = infos.map(\.minRPM).filter { $0 > 0 }.max() ?? 0
+        let maximum = infos.map(\.maxRPM).filter { $0 > 0 }.min() ?? 0
+        if minimum > 0 && rpm < minimum {
             throw ThermalForgeError.rpmOutOfRange(
-                requested: rpm, min: info.minRPM, max: info.maxRPM
+                requested: rpm, min: minimum, max: maximum
             )
         }
-        if info.maxRPM > 0 && rpm > info.maxRPM {
+        if maximum > 0 && rpm > maximum {
             throw ThermalForgeError.rpmOutOfRange(
-                requested: rpm, min: info.minRPM, max: info.maxRPM
+                requested: rpm, min: minimum, max: maximum
             )
         }
 
@@ -342,6 +372,12 @@ public final class FanControl {
     public static let safetyTempKeys: [String] =
         thermalKeys.filter { key in ["TC", "Tp", "TG", "Tg"].contains { key.hasPrefix($0) } }
 
+    /// Thermal keys confirmed present during initialization.
+    public var availableThermalKeys: [String] { supportedThermalKeys }
+
+    /// CPU/GPU safety keys confirmed present during initialization.
+    public var availableSafetyTemperatureKeys: [String] { supportedSafetyTemperatureKeys }
+
     /// Read one temperature key, decoding by returned size (flt 4-byte or ioft 8-byte).
     /// nil if absent, wrong size, or out of the sane 0–150°C range. Does NOT lock — the
     /// caller serializes SMC access (the daemon takes smcLock per key so a full sweep
@@ -387,7 +423,7 @@ public final class FanControl {
         // Probe every known thermal key (flt/ioft decoded by size in readTemp). Keys
         // that don't exist on this machine return nil and are skipped.
         var temps: [String: Float] = [:]
-        for key in Self.thermalKeys {
+        for key in supportedThermalKeys {
             if let t = readTemp(key) { temps[key] = t }
         }
 

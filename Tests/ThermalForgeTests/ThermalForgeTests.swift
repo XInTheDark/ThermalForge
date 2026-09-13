@@ -10,6 +10,20 @@ import Testing
 @Suite("Data Conversion")
 struct DataConversionTests {
 
+    @Test("Calibration rejects duplicate temperature points")
+    func calibrationRejectsDuplicateTemperatures() {
+        let data = CalibrationData(
+            machine: "test", fans: 2, maxRPM: 7000, minRPM: 1200,
+            calibratedAt: "now",
+            measurements: [
+                .init(targetTemp: 60, holdingRPMPercent: 0.3),
+                .init(targetTemp: 60, holdingRPMPercent: 0.4),
+            ]
+        )
+        #expect(data.validationError != nil)
+        #expect(data.fanPercentForTemp(60) == nil)
+    }
+
     @Test("Float round-trips through SMC byte encoding")
     func floatRoundTrip() {
         let values: [Float] = [0.0, 1200.0, 2317.0, 3500.5, 5900.0, 7826.0]

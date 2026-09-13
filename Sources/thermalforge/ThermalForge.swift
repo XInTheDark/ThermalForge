@@ -9,6 +9,13 @@ import ArgumentParser
 import Foundation
 import ThermalForgeCore
 
+private func consoleUserUID() -> Int? {
+    guard let uid = (try? FileManager.default.attributesOfItem(atPath: "/dev/console")[.ownerAccountID]) as? NSNumber else {
+        return nil
+    }
+    return uid.intValue == 0 ? nil : uid.intValue
+}
+
 @main
 struct ThermalForge: ParsableCommand {
     static let configuration = CommandConfiguration(
@@ -625,21 +632,23 @@ struct Install: ParsableCommand {
         }
 
         // The daemon runs under launchd with no SUDO_UID of its own, so capture the
-        // controlling user here and bake it into the plist (1c). Absent means
-        // "already root, not via sudo" (a root shell) — refuse rather than default to
-        // 0, which would make the socket root-only and brick the user's app. A
-        // non-root user never reaches this line — the geteuid() guard above stops them.
-        guard let sudoUIDString = ProcessInfo.processInfo.environment["SUDO_UID"],
-              let ownerUID = Int(sudoUIDString), ownerUID != 0 else {
+        // controlling user here and bake it into the plist. Normal sudo invocations
+        // provide SUDO_UID; the app's administrator-authenticated installer does
+        // not, so fall back to the user who owns /dev/console.
+        let ownerUID: Int
+        if let sudoUIDString = ProcessInfo.processInfo.environment["SUDO_UID"],
+           let sudoUID = Int(sudoUIDString), sudoUID != 0 {
+            ownerUID = sudoUID
+        } else if let consoleUID = consoleUserUID() {
+            ownerUID = consoleUID
+        } else {
             throw ValidationError("""
-                Can't determine who should own fan control: SUDO_UID isn't set.
+                Can't determine who should own fan control.
                 Run the install with sudo from your normal user account:
 
                     sudo thermalforge install
 
-                Don't run it from a root shell (su / sudo -i) — the daemon needs your
-                user's id so your app and CLI work without sudo. Installing as root
-                would lock every non-root account out of fan control.
+                The daemon needs your user's id so your app and CLI work without sudo.
                 """)
         }
 
@@ -1127,6 +1136,9 @@ struct BuildApp: ParsableCommand {
     @Option(name: .long, help: "Path to the .icns app icon")
     var icon: String
 
+    @Option(name: .long, help: "Optional CLI binary to embed for one-click daemon installation")
+    var cli: String?
+
     @Option(name: .long, help: "Destination .app bundle path (created or replaced)")
     var dest: String
 
@@ -1138,6 +1150,9 @@ struct BuildApp: ParsableCommand {
         }
         guard fm.fileExists(atPath: icon) else {
             throw ValidationError("Icon not found: \(icon)")
+        }
+        if let cli, !fm.fileExists(atPath: cli) {
+            throw ValidationError("CLI binary not found: \(cli)")
         }
 
         let contents = "\(dest)/Contents"
@@ -1153,6 +1168,9 @@ struct BuildApp: ParsableCommand {
 
         try fm.copyItem(atPath: binary, toPath: "\(macOSDir)/ThermalForgeApp")
         try fm.copyItem(atPath: icon, toPath: "\(resources)/AppIcon.icns")
+        if let cli {
+            try fm.copyItem(atPath: cli, toPath: "\(resources)/thermalforge")
+        }
 
         let plist = """
             <?xml version="1.0" encoding="UTF-8"?>

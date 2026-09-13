@@ -57,7 +57,7 @@ public struct CalibrationData: Codable {
     /// Look up the fan speed needed to hold a given temperature.
     /// Interpolates between measured points.
     public func fanPercentForTemp(_ temp: Float) -> Float? {
-        guard measurements.count >= 2 else { return nil }
+        guard measurements.count >= 2, validationError == nil else { return nil }
         let sorted = measurements.sorted { $0.targetTemp < $1.targetTemp }
 
         // Below lowest measured temp — use lowest fan speed
@@ -98,6 +98,9 @@ public struct CalibrationData: Codable {
         // Higher temps should need higher fan speeds
         let sorted = measurements.sorted { $0.targetTemp < $1.targetTemp }
         for i in 0..<(sorted.count - 1) {
+            if sorted[i + 1].targetTemp <= sorted[i].targetTemp {
+                return "Measurement temperatures must be strictly increasing"
+            }
             if sorted[i + 1].holdingRPMPercent < sorted[i].holdingRPMPercent - 0.05 {
                 return "Fan speed decreases from \(Int(sorted[i].targetTemp))°C to \(Int(sorted[i + 1].targetTemp))°C — data inconsistent"
             }
@@ -577,7 +580,9 @@ public final class CalibrationRunner {
 
         for i in 0..<(data.count - 1) {
             if temp >= data[i].equilTemp && temp <= data[i + 1].equilTemp {
-                let t = (temp - data[i].equilTemp) / (data[i + 1].equilTemp - data[i].equilTemp)
+                let range = data[i + 1].equilTemp - data[i].equilTemp
+                guard range != 0 else { return data[i + 1].fanPct }
+                let t = (temp - data[i].equilTemp) / range
                 return data[i].fanPct + t * (data[i + 1].fanPct - data[i].fanPct)
             }
         }

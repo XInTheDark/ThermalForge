@@ -35,6 +35,7 @@ sudo .build/release/thermalforge install
 sudo .build/release/thermalforge build-app \
     --binary .build/release/ThermalForgeApp \
     --icon ThermalForge.icns \
+    --cli .build/release/thermalforge \
     --dest /Applications/ThermalForge.app
 sudo xattr -cr /Applications/ThermalForge.app
 

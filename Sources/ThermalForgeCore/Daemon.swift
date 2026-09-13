@@ -472,8 +472,20 @@ public final class DaemonServer {
     /// Clamp a requested RPM to the fan's cached [min, max]. Returns the value to apply
     /// and an advisory note if it was clamped (the command still succeeds).
     private func clampRPM(_ rpm: Float, fan: Int) -> (value: Float, note: String?) {
-        guard fan >= 0, fan < fanLimits.count else { return (rpm, nil) }
-        let limit = fanLimits[fan]
+        let limit: (min: Float, max: Float)?
+        if fan < 0 {
+            // `set` applies one target to every fan, so use the intersection of
+            // all fan ranges. Using fan 0 alone can make FanControl reject the
+            // command (or partially write) when another fan has tighter limits.
+            let mins = fanLimits.map { $0.min }.filter { $0 > 0 }
+            let maxes = fanLimits.map { $0.max }.filter { $0 > 0 }
+            limit = (mins.max() ?? 0, maxes.min() ?? 0)
+        } else if fan < fanLimits.count {
+            limit = fanLimits[fan]
+        } else {
+            limit = nil
+        }
+        guard let limit else { return (rpm, nil) }
         if limit.max > 0 && rpm > limit.max {
             return (limit.max, "clamped \(Int(rpm)) → \(Int(limit.max)) RPM (max)")
         }
@@ -529,7 +541,7 @@ public final class DaemonServer {
     private func currentSafetyTemp() -> Float? {
         if let injected = injectedSampler { return injected() }
         var peak: Float = 0
-        for key in FanControl.safetyTempKeys {
+        for key in fanControl.availableSafetyTemperatureKeys {
             smcLock.lock()
             let t = fanControl.readTemp(key)
             smcLock.unlock()
@@ -742,7 +754,7 @@ public final class DaemonServer {
                 }
                 if !allowWrite() { response = rateLimited; break }
                 if blockedByCLIHold() { response = .failure(.heldByCLI, "held by cli"); break }
-                let (clamped, note) = clampRPM(Float(rpm), fan: 0)
+                let (clamped, note) = clampRPM(Float(rpm), fan: -1)
                 if !isSuspended() { try fanControl.setAllFans(rpm: clamped) }
                 recordHold("set \(Int(clamped))")
                 response = .ok(note: note, appliedRPM: Int(clamped))
