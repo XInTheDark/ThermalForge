@@ -48,6 +48,12 @@ public struct ThermalStatus: Encodable {
     public let fans: [FanStatus]
     public let temperatures: [String: Float]
 
+    public var cpuCoreMax: Float? { cpuCoreMaxTemp }
+    public var gpuCoreMax: Float? { gpuCoreMaxTemp }
+    public var nominalPeak: Float { nominalPeakTemp }
+    public var siliconHotspot: Float { siliconHotspotTemp }
+    public var safetyPeak: Float { safetyPeakTemp }
+
     public struct FanStatus: Encodable {
         public let index: Int
         public let actualRPM: Int
@@ -55,6 +61,27 @@ public struct ThermalStatus: Encodable {
         public let minRPM: Int
         public let maxRPM: Int
         public let mode: String
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case cpuCoreMax
+        case fans
+        case gpuCoreMax
+        case nominalPeak
+        case safetyPeak
+        case siliconHotspot
+        case temperatures
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(fans, forKey: .fans)
+        try container.encode(temperatures, forKey: .temperatures)
+        try container.encodeIfPresent(cpuCoreMax, forKey: .cpuCoreMax)
+        try container.encodeIfPresent(gpuCoreMax, forKey: .gpuCoreMax)
+        try container.encode(nominalPeak, forKey: .nominalPeak)
+        try container.encode(siliconHotspot, forKey: .siliconHotspot)
+        try container.encode(safetyPeak, forKey: .safetyPeak)
     }
 }
 
@@ -77,12 +104,12 @@ extension ThermalStatus {
     }
 
     /// Peak of the CPU core diodes (matching Stats' "Hottest CPU").
-    /// Uses nominal core diodes across M1-M5 and Intel. Falls back to
-    /// non-hotspot CPU sensors if specific core keys aren't matched.
+    /// Uses nominal core diodes resolved for the detected Apple Silicon / Intel platform.
+    /// Falls back to non-hotspot CPU sensors if specific core keys aren't matched.
     public var cpuCoreMaxTemp: Float? {
-        let coreTemps = temperatures.filter { key, _ in
-            FanControl.cpuCoreKeys.contains(key)
-        }.values
+        let platform = FanControl.inferPlatform(from: temperatures)
+        let keys = FanControl.cpuCoreKeys(for: platform)
+        let coreTemps = temperatures.filter { key, _ in keys.contains(key) }.values
         if let max = coreTemps.max() { return max }
         let nonHotspot = temperatures.filter { key, _ in
             ["TC", "Tp", "Te", "Tf"].contains { key.hasPrefix($0) } && !FanControl.hotspotKeys.contains(key)
@@ -94,12 +121,12 @@ extension ThermalStatus {
 
     /// Peak of the GPU core diodes (matching Stats' "Hottest GPU").
     public var gpuCoreMaxTemp: Float? {
-        let coreTemps = temperatures.filter { key, _ in
-            FanControl.gpuCoreKeys.contains(key)
-        }.values
+        let platform = FanControl.inferPlatform(from: temperatures)
+        let keys = FanControl.gpuCoreKeys(for: platform)
+        let coreTemps = temperatures.filter { key, _ in keys.contains(key) }.values
         if let max = coreTemps.max() { return max }
         return temperatures.filter { key, _ in
-            ["TG", "Tg"].contains { key.hasPrefix($0) }
+            ["TG", "Tg"].contains { key.hasPrefix($0) } && !FanControl.hotspotKeys.contains(key)
         }.values.max()
     }
 
@@ -419,45 +446,132 @@ public final class FanControl: ThermalStatusSource {
 
     // MARK: - Core Diode & Hotspot Sensor Keys (Stats-aligned)
 
-    /// Nominal CPU core diode keys across Apple Silicon generations (M1–M5) and Intel,
-    /// matching the exact keys used by the open-source Stats monitor (exelban/stats).
-    /// These measure the core center diode temperature and drive steady-state cooling curves.
-    public static let cpuCoreKeys: Set<String> = [
-        // Intel
-        "TC0D", "TC0E", "TC0F", "TC0P", "TCAD",
-        // Apple Silicon M1 (Tp09, Tp0T = E-cores; Tp01..Tp0b = P-cores)
-        "Tp09", "Tp0T",
-        "Tp01", "Tp05", "Tp0D", "Tp0H", "Tp0L", "Tp0P", "Tp0X", "Tp0b",
-        // Apple Silicon M2 (Tp1h..Tp1l = E-cores; Tp01..Tp0j = P-cores)
-        "Tp1h", "Tp1t", "Tp1p", "Tp1l",
-        "Tp0f", "Tp0j",
-        // Apple Silicon M3 (Te05..Te0S = E-cores; Tf04..Tf4E = P-cores)
-        "Te05", "Te0L", "Te0P", "Te0S",
-        "Tf04", "Tf09", "Tf0A", "Tf0B", "Tf0D", "Tf0E", "Tf44", "Tf49", "Tf4A", "Tf4B", "Tf4D", "Tf4E",
-        // Apple Silicon M4 (Te05, Te0S, Te09, Te0H = E-cores; Tp01..Tp0e = P-cores)
-        "Te09", "Te0H",
-        "Tp0V", "Tp0Y", "Tp0e",
-        // Apple Silicon M5 (Tp00..Tp0K = Super/E-cores; Tp0O..Tp0y = P-cores)
-        "Tp00", "Tp04", "Tp08", "Tp0C", "Tp0G", "Tp0K",
-        "Tp0O", "Tp0R", "Tp0U", "Tp0a", "Tp0d", "Tp0g", "Tp0m", "Tp0p", "Tp0u", "Tp0y",
-    ]
+    public enum Platform: String, CaseIterable {
+        case intel
+        case m1
+        case m2
+        case m3
+        case m4
+        case m5
+        case unknown
+    }
 
-    /// Nominal GPU core diode keys across Apple Silicon generations (M1–M5) and Intel/AMD,
-    /// matching the exact keys used by the Stats monitor.
-    public static let gpuCoreKeys: Set<String> = [
-        // Intel / AMD
-        "TCGC", "TG0D", "TGDD", "TG0H", "TG0P",
-        // M1
-        "Tg05", "Tg0D", "Tg0L", "Tg0T",
-        // M2
-        "Tg0f", "Tg0j",
-        // M3
-        "Tf14", "Tf18", "Tf19", "Tf1A", "Tf24", "Tf28", "Tf29", "Tf2A",
-        // M4
-        "Tg0G", "Tg0H", "Tg1U", "Tg1k", "Tg0K", "Tg0d", "Tg0e", "Tg0k",
-        // M5
-        "Tg0U", "Tg0X", "Tg0g", "Tg1Y", "Tg1c", "Tg1g",
-    ]
+    /// Read the host CPU brand string via sysctl to determine the platform architecture.
+    public static var currentPlatform: Platform {
+        var size = 0
+        sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0)
+        guard size > 0 else { return .unknown }
+        var nameChars = [CChar](repeating: 0, count: size)
+        sysctlbyname("machdep.cpu.brand_string", &nameChars, &size, nil, 0)
+        let name = String(cString: nameChars).lowercased()
+        if name.contains("intel") { return .intel }
+        if name.contains("m1") { return .m1 }
+        if name.contains("m2") { return .m2 }
+        if name.contains("m3") { return .m3 }
+        if name.contains("m4") { return .m4 }
+        if name.contains("m5") { return .m5 }
+        return .unknown
+    }
+
+    /// CPU core diode keys for a specific platform matching Stats (exelban/stats).
+    /// Prevents cross-generation sensor collisions (e.g. Tp0f is a P-core on M2, but an 80°C+ hotspot on M4).
+    public static func cpuCoreKeys(for platform: Platform) -> Set<String> {
+        switch platform {
+        case .intel:
+            return ["TC0D", "TC0E", "TC0F", "TC0H", "TC0P", "TCAD"]
+        case .m1:
+            return [
+                "Tp09", "Tp0T",
+                "Tp01", "Tp05", "Tp0D", "Tp0H", "Tp0L", "Tp0P", "Tp0X", "Tp0b",
+            ]
+        case .m2:
+            return [
+                "Tp1h", "Tp1t", "Tp1p", "Tp1l",
+                "Tp01", "Tp05", "Tp09", "Tp0D", "Tp0X", "Tp0b", "Tp0f", "Tp0j",
+            ]
+        case .m3:
+            return [
+                "Te05", "Te0L", "Te0P", "Te0S",
+                "Tf04", "Tf09", "Tf0A", "Tf0B", "Tf0D", "Tf0E", "Tf44", "Tf49", "Tf4A", "Tf4B", "Tf4D", "Tf4E",
+            ]
+        case .m4:
+            return [
+                "Te05", "Te0S", "Te09", "Te0H",
+                "Tp01", "Tp05", "Tp09", "Tp0D", "Tp0V", "Tp0Y", "Tp0b", "Tp0e",
+            ]
+        case .m5:
+            return [
+                "Tp00", "Tp04", "Tp08", "Tp0C", "Tp0G", "Tp0K",
+                "Tp0O", "Tp0R", "Tp0U", "Tp0X", "Tp0a", "Tp0d", "Tp0g", "Tp0j", "Tp0m", "Tp0p", "Tp0u", "Tp0y",
+            ]
+        case .unknown:
+            return allCpuCoreKeys.subtracting(hotspotKeys)
+        }
+    }
+
+    /// GPU core diode keys for a specific platform matching Stats.
+    public static func gpuCoreKeys(for platform: Platform) -> Set<String> {
+        switch platform {
+        case .intel:
+            return ["TCGC", "TG0D", "TGDD", "TG0H", "TG0P"]
+        case .m1:
+            return ["Tg05", "Tg0D", "Tg0L", "Tg0T"]
+        case .m2:
+            return ["Tg0f", "Tg0j"]
+        case .m3:
+            return ["Tf14", "Tf18", "Tf19", "Tf1A", "Tf24", "Tf28", "Tf29", "Tf2A"]
+        case .m4:
+            return ["Tg0G", "Tg0H", "Tg1U", "Tg1k", "Tg0K", "Tg0L", "Tg0d", "Tg0e", "Tg0j", "Tg0k"]
+        case .m5:
+            return ["Tg0U", "Tg0X", "Tg0d", "Tg0g", "Tg0j", "Tg1Y", "Tg1c", "Tg1g"]
+        case .unknown:
+            return allGpuCoreKeys.subtracting(hotspotKeys)
+        }
+    }
+
+    /// All known CPU core diode keys across all platforms (for SMC probing).
+    public static let allCpuCoreKeys: Set<String> = Platform.allCases.reduce(into: Set<String>()) { acc, p in
+        if p != .unknown { acc.formUnion(cpuCoreKeys(for: p)) }
+    }
+
+    /// All known GPU core diode keys across all platforms (for SMC probing).
+    public static let allGpuCoreKeys: Set<String> = Platform.allCases.reduce(into: Set<String>()) { acc, p in
+        if p != .unknown { acc.formUnion(gpuCoreKeys(for: p)) }
+    }
+
+    /// Active CPU core keys for the host Mac.
+    public static var cpuCoreKeys: Set<String> { cpuCoreKeys(for: currentPlatform) }
+
+    /// Active GPU core keys for the host Mac.
+    public static var gpuCoreKeys: Set<String> { gpuCoreKeys(for: currentPlatform) }
+
+    /// Infer platform from temperature dictionary keys (used when evaluating snapshots from any machine or test).
+    public static func inferPlatform(from temperatures: [String: Float]) -> Platform {
+        let keys = Set(temperatures.keys)
+        if keys.contains(where: { $0.hasPrefix("Tf") }) {
+            return .m3
+        }
+        if keys.contains(where: { $0.hasPrefix("Tp1") }) {
+            return .m2
+        }
+        if keys.contains(where: { ["Tp0O", "Tp0R", "Tp0g", "Tp0m", "Tp0p", "Tp0u", "Tp0y"].contains($0) }) {
+            return .m5
+        }
+        let current = currentPlatform
+        if current != .unknown && !keys.intersection(cpuCoreKeys(for: current)).isEmpty {
+            return current
+        }
+        if keys.contains(where: { $0.hasPrefix("Te") }) {
+            return .m4
+        }
+        if keys.contains(where: { $0.hasPrefix("Tp0") }) {
+            return .m1
+        }
+        if keys.contains(where: { $0.hasPrefix("TC") }) {
+            return .intel
+        }
+        return current
+    }
 
     /// On-die silicon junction hotspots, execution unit diodes, and complex aggregates.
     /// These are watched strictly by the thermal safety floor and emergency upper limit override.
@@ -465,7 +579,7 @@ public final class FanControl: ThermalStatusSource {
         // Package & die aggregates
         "TCDX", "TCHP", "TCMb", "TCMz",
         // CPU core hotspot diodes (triplets)
-        "Tp02", "Tp06", "Tp0A", "Tp0E", "Tp0W", "Tp0Z", "Tp0c",
+        "Tp02", "Tp06", "Tp0A", "Tp0E", "Tp0W", "Tp0Z", "Tp0c", "Tp0f",
         "Tp3P", "Tp3T", "Tp3X",
         "Te06", "Te0A", "Te0I", "Te0T", "Te0V", "Te0X",
         // GPU hotspots
@@ -478,8 +592,8 @@ public final class FanControl: ThermalStatusSource {
     /// return nil from `readTemp` and are skipped. Single source of truth so the
     /// daemon's safety floor reads exactly the CPU/GPU subset `status()` would.
     public static let thermalKeys: [String] = Array(
-        cpuCoreKeys
-            .union(gpuCoreKeys)
+        allCpuCoreKeys
+            .union(allGpuCoreKeys)
             .union(hotspotKeys)
             .union([
                 // Memory

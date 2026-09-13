@@ -125,4 +125,44 @@ struct ProfileTests {
         #expect(m3Status.nominalPeakTemp == 66.5)
         #expect(m3Status.hasUsableSafetyTemperature == true)
     }
+
+    @Test("M4 hotspot Tp0f is excluded from core max and isolated to hotspot/safety")
+    func m4HotspotTp0f() {
+        let m4Status = ThermalStatus(
+            fans: [],
+            temperatures: [
+                // E-cores
+                "Te05": 60.7, "Te09": 60.9, "Te0H": 59.8, "Te0S": 59.6,
+                // P-cores (peak 66.3°C on Tp0V)
+                "Tp01": 64.7, "Tp05": 65.4, "Tp09": 65.4, "Tp0D": 65.2,
+                "Tp0V": 66.3, "Tp0Y": 65.5, "Tp0b": 65.5, "Tp0e": 65.4,
+                // Hotspots (Tp0f is 82.5°C on M4)
+                "Tp0f": 82.5, "Tp0W": 81.6, "TCMz": 82.7,
+            ]
+        )
+        // CPU core max must be 66.3°C (Tp0V), NOT 82.5°C (Tp0f)
+        #expect(m4Status.cpuCoreMaxTemp == 66.3)
+        #expect(m4Status.nominalPeakTemp == 66.3)
+        #expect(m4Status.siliconHotspotTemp == 82.7)
+        #expect(m4Status.safetyPeakTemp == 82.7)
+    }
+
+    @Test("ThermalStatus encodes summary fields into JSON for status reporting")
+    func thermalStatusEncoding() throws {
+        let status = ThermalStatus(
+            fans: [],
+            temperatures: [
+                "Te05": 60.0,
+                "Tp01": 65.0,
+                "Tp0f": 82.0,
+            ]
+        )
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try encoder.encode(status)
+        let json = try #require(String(data: data, encoding: .utf8))
+        #expect(json.contains("\"cpu_core_max\" : 65") || json.contains("\"cpu_core_max\":65"))
+        #expect(json.contains("\"silicon_hotspot\" : 82") || json.contains("\"silicon_hotspot\":82"))
+        #expect(json.contains("\"nominal_peak\" : 65") || json.contains("\"nominal_peak\":65"))
+    }
 }
