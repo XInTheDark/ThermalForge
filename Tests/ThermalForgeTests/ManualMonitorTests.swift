@@ -51,9 +51,18 @@ struct ManualMonitorTests {
         try #require(updates.wait(timeout: .now() + 2) == .success)
         source.fail(failure)
         try #require(commands.received.wait(timeout: .now() + 2) == .success)
-        #expect(commands.values == [.resetAuto])
-        #expect(monitor.isControlFaultLatched)
-        #expect(!monitor.hasRecentControlTick())
+        if failure == .overheated {
+            #expect(commands.values == [.safetyMax])
+            #expect(monitor.isSafetyLockedAtMax)
+        } else {
+            #expect(commands.values == [.resetAuto])
+            #expect(monitor.isControlFaultLatched)
+        }
+        if failure == .overheated {
+            #expect(monitor.hasRecentControlTick())
+        } else {
+            #expect(!monitor.hasRecentControlTick())
+        }
 
         source.fail(nil)
         monitor.requestReapply()
@@ -61,8 +70,13 @@ struct ManualMonitorTests {
         let drained = DispatchSemaphore(value: 0)
         monitor.setManualControl(false) { drained.signal() }
         try #require(drained.wait(timeout: .now() + 2) == .success)
-        #expect(monitor.isControlFaultLatched)
-        #expect(commands.values == [.resetAuto])
+        if failure == .overheated {
+            #expect(monitor.isSafetyLockedAtMax)
+            #expect(commands.values == [.safetyMax])
+        } else {
+            #expect(monitor.isControlFaultLatched)
+            #expect(commands.values == [.resetAuto])
+        }
     }
 
     enum Failure: Error {
@@ -86,7 +100,7 @@ struct ManualMonitorTests {
             return ThermalStatus(
                 fans: [.init(index: 0, actualRPM: 4000, targetRPM: 4000,
                              minRPM: 2000, maxRPM: 8000, mode: "manual")],
-                temperatures: failure == .missingSensors ? [:] : ["TC0P": failure == .overheated ? 96 : 75]
+                temperatures: failure == .missingSensors ? [:] : ["TC0P": failure == .overheated ? 106 : 75]
             )
         }
     }

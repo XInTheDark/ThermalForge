@@ -129,14 +129,40 @@ public struct DaemonRequest: Codable, Equatable {
     /// Apply as an unsupervised hold (heartbeat watchdog stays disarmed) — replaces
     /// the old trailing " oneshot" token. Meaningful only for hold verbs.
     public var oneshot: Bool
+    /// Marks an app max command as a thermal safety latch. Older daemons ignore
+    /// this additional field and still apply the max command normally.
+    public var safetyLock: Bool
+    /// Optional safety threshold carried on heartbeat/configuration requests.
+    /// Older daemons ignore the additional field.
+    public var safetyLimitTemp: Float?
+
+    private enum CodingKeys: String, CodingKey {
+        case v, verb, rpm, fan, oneshot, safetyLock, safetyLimitTemp
+    }
 
     public init(verb: Verb, rpm: Int? = nil, fan: Int? = nil, oneshot: Bool = false,
+                safetyLock: Bool = false, safetyLimitTemp: Float? = nil,
                 v: Int = DaemonProtocol.version) {
         self.v = v
         self.verb = verb
         self.rpm = rpm
         self.fan = fan
         self.oneshot = oneshot
+        self.safetyLock = safetyLock
+        self.safetyLimitTemp = safetyLimitTemp
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        v = try container.decode(Int.self, forKey: .v)
+        verb = try container.decode(Verb.self, forKey: .verb)
+        rpm = try container.decodeIfPresent(Int.self, forKey: .rpm)
+        fan = try container.decodeIfPresent(Int.self, forKey: .fan)
+        oneshot = try container.decodeIfPresent(Bool.self, forKey: .oneshot) ?? false
+        // These fields were added after the initial framed protocol. Missing
+        // values must retain the old request semantics.
+        safetyLock = try container.decodeIfPresent(Bool.self, forKey: .safetyLock) ?? false
+        safetyLimitTemp = try container.decodeIfPresent(Float.self, forKey: .safetyLimitTemp)
     }
 
     /// The wire request for a `FanCommand` — the exact mapping `DaemonClient.execute`
@@ -147,12 +173,16 @@ public struct DaemonRequest: Codable, Equatable {
         switch command {
         case .setMax:
             self.init(verb: .max, oneshot: os)
+        case .safetyMax:
+            self.init(verb: .max, safetyLock: true)
         case .setRPM(let rpm):
             self.init(verb: .set, rpm: Int(rpm), oneshot: os)
         case .setFan(let index, let rpm):
             self.init(verb: .setfan, rpm: Int(rpm), fan: index, oneshot: os)
         case .resetAuto:
             self.init(verb: .auto)
+        case .setSafetyLimit(let temp):
+            self.init(verb: .heartbeat, safetyLimitTemp: temp)
         }
     }
 }
@@ -164,6 +194,8 @@ public enum DaemonErrorKind: String, Codable, Equatable {
     case usage
     /// A supervised command was refused while an unsupervised CLI hold is active.
     case heldByCLI
+    /// A fan write was refused while the daemon's thermal safety latch is active.
+    case safetyLocked
     /// The request's protocol version (or verb) is newer than the daemon understands;
     /// the response's `version` carries the daemon's build so the client can react.
     case unsupportedVersion

@@ -65,6 +65,15 @@ final class AppState: ObservableObject {
                                              rampDownWindow: rampDownWindowSeconds)
         }
     }
+    @Published var safetyLimitTemp: Double = AppState.loadSafetyLimit() {
+        didSet {
+            let clamped = min(max(safetyLimitTemp, 85.0), 115.0)
+            if clamped != safetyLimitTemp { safetyLimitTemp = clamped; return }
+            UserDefaults.standard.set(clamped, forKey: Self.safetyLimitTempKey)
+            monitor?.updateSafetyLimit(Float(clamped))
+            commandPump.submit(.setSafetyLimit(Float(clamped)))
+        }
+    }
     @Published var smoothedPeakTemp: Float?
     /// Reflects the current SMAppService login-item status so the menu toggle shows the
     /// right state. Initialized from that status as the property's DEFAULT (not reassigned
@@ -122,7 +131,7 @@ final class AppState: ObservableObject {
         daemonInstalled == true && externalHold == nil && sensorFaultMessage == nil &&
         monitor?.hasRecentControlTick() == true &&
         latestStatus?.hasUsableSafetyTemperature == true &&
-        (latestStatus?.safetyPeakTemp ?? .infinity) < FanProfile.safetyTempThreshold &&
+        (latestStatus?.safetyPeakTemp ?? .infinity) < Float(safetyLimitTemp) &&
         latestStatus?.manualFanCommands(forPercent: manualFanPercent) != nil
     }
 
@@ -131,6 +140,7 @@ final class AppState: ObservableObject {
     static let temperatureSmoothingKey = "temperatureSmoothingEnabled"
     static let rampUpWindowSecondsKey = "rampUpWindowSeconds"
     static let rampDownWindowSecondsKey = "rampDownWindowSeconds"
+    static let safetyLimitTempKey = "safetyLimitTemperature"
     static let sensorRefreshOptions: [Double] = [0.5, 1.0, 2.0, 5.0]
     static let controlLoopOptions: [Double] = [0.05, 0.1, 0.25, 0.5]
 
@@ -143,6 +153,12 @@ final class AppState: ObservableObject {
             return min(max(value, 0.05), 1.0)
         }
         return value
+    }
+
+    private static func loadSafetyLimit() -> Double {
+        let value = UserDefaults.standard.object(forKey: safetyLimitTempKey) as? Double ?? 105.0
+        guard value.isFinite else { return 105.0 }
+        return min(max(value, 85.0), 115.0)
     }
 
     private func profileForID(_ id: String) -> FanProfile {
@@ -172,11 +188,21 @@ final class AppState: ObservableObject {
                 try executor.execute(command)
                 return true
             } catch {
+                if case .setSafetyLimit = command {
+                    TFLogger.shared.error("Safety limit synchronization failed: \(error)")
+                    return false
+                }
                 // Failure is NEVER silent. If a CLI hold owns the fans, this is
                 // expected arbitration — reflect it on the main actor so the monitor
                 // stops trying and the banner appears immediately (don't wait up to
                 // 5s for the poll). Otherwise it's a real failure — log it.
-                if let state = try? DaemonClient().readState(), state.isCLIHold {
+                if let state = try? DaemonClient().readState(), state.safetyLatched {
+                    TFLogger.shared.error("Fan command blocked by the daemon safety latch: \(command)")
+                    Task { @MainActor in
+                        self?.sensorFaultMessage = "Fans are locked at maximum by thermal safety. Press Default or Apple Auto to reset."
+                        self?.monitor?.restoreSafetyLock()
+                    }
+                } else if let state = try? DaemonClient().readState(), state.isCLIHold {
                     TFLogger.shared.info("Fan command yielded to CLI hold: \(command)")
                     Task { @MainActor in self?.externalHold = state }
                 } else {
@@ -218,6 +244,7 @@ final class AppState: ObservableObject {
     /// crash recovery the old reset provided, without the collateral damage.
     private func adoptDaemonStateOnLaunch() {
         let executor = self.executor
+        let configuredSafetyLimit = Float(self.safetyLimitTemp)
         // Read the daemon's launch state OFF the main thread so an unresponsive
         // daemon can't stall app launch — the socket read is bounded by the sendRaw
         // timeout. runAtLaunch puts this on the pump's serial queue AHEAD of any
@@ -230,8 +257,12 @@ final class AppState: ObservableObject {
 
             // Same four-way decision as before, just resolved off-main; any reset
             // runs here and only the resulting externalHold is applied on main.
+            let safetyLatched = state?.safetyLatched == true
             let adopted: DaemonHoldState?
-            if let state, state.isCLIHold {
+            if safetyLatched {
+                adopted = state?.isCLIHold == true ? state : nil
+                TFLogger.shared.info("App launched — preserving daemon thermal safety latch")
+            } else if let state, state.isCLIHold {
                 // Deliberate CLI hold — reflect it, don't touch it.
                 adopted = state
                 TFLogger.shared.info("App launched — reflecting CLI hold: \(state.command ?? "?")")
@@ -258,6 +289,10 @@ final class AppState: ObservableObject {
                 TFLogger.shared.info("App launched — daemon state unreadable; reset to auto (degraded)")
             }
 
+            // Configure the daemon before any queued profile command can run.
+            // Older daemons ignore the additional heartbeat field.
+            try? executor.execute(.setSafetyLimit(configuredSafetyLimit))
+
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.externalHold = adopted
@@ -267,7 +302,10 @@ final class AppState: ObservableObject {
                 // stale app hold), apply the saved choice, so a crash while Default was
                 // running comes back to Default. Deferred to here so the hold state is known
                 // before any fan command is issued (no pre-adopt commands in the window).
-                if adopted == nil {
+                if safetyLatched {
+                    self.sensorFaultMessage = "Fans are locked at maximum by thermal safety. Press Default or Apple Auto to reset."
+                    self.monitor?.restoreSafetyLock()
+                } else if adopted == nil {
                     let restored = self.restoredProfile()
                     self.activeProfile = restored
                     self.monitor?.switchProfile(restored)
@@ -306,9 +344,14 @@ final class AppState: ObservableObject {
             if !loopHealthy {
                 monitor?.suspendForEmergency("the control loop stopped responding")
             }
-            let firstBeat = loopHealthy && (try? client.request(DaemonRequest(verb: .heartbeat)))?.ok == true
-            let hbOK = firstBeat || (loopHealthy && ((try? client.request(DaemonRequest(verb: .heartbeat)))?.ok == true))
-            let registered = ThermalForgeDaemon.isRegisteredWithLaunchd
+            let storedSafetyLimit = UserDefaults.standard.object(forKey: "safetyLimitTemperature") as? Double ?? 105.0
+            let safetyLimit = Float(min(max(storedSafetyLimit.isFinite ? storedSafetyLimit : 105.0, 85.0), 115.0))
+            let heartbeat = DaemonRequest(verb: .heartbeat, safetyLimitTemp: safetyLimit)
+            let firstBeat = loopHealthy && (try? client.request(heartbeat))?.ok == true
+            let hbOK = firstBeat || (loopHealthy && ((try? client.request(heartbeat))?.ok == true))
+            // If the daemon responded over the socket, it is definitely registered and running.
+            // Avoid a costly /bin/launchctl process fork/exec on every 5s heartbeat tick.
+            let registered = hbOK ? true : ThermalForgeDaemon.isRegisteredWithLaunchd
 
             // Advisory: version + state. On failure/timeout DON'T assert — leave
             // the last known value untouched rather than clearing the banner on a
@@ -351,6 +394,12 @@ final class AppState: ObservableObject {
                 if didReadVersion { self.daemonVersionMismatch = versionValue }
                 if didReadState {
                     self.externalHold = holdValue?.isCLIHold == true ? holdValue : nil
+                    if holdValue?.safetyLatched == true {
+                        self.sensorFaultMessage = self.sensorFaultMessage ?? "Fans are locked at maximum by thermal safety. Press Default or Apple Auto to reset."
+                        if self.monitorState != .safetyOverride {
+                            monitor?.restoreSafetyLock()
+                        }
+                    }
                     if let appliedAt = self.manualAppliedAt,
                        stateReadStarted >= appliedAt, holdValue?.owner != "app" {
                         // A confirmed release ends the test. Leave the monitor
@@ -499,8 +548,18 @@ final class AppState: ObservableObject {
                 isEnabled: temperatureSmoothingEnabled,
                 rampUpWindowSeconds: rampUpWindowSeconds,
                 rampDownWindowSeconds: rampDownWindowSeconds
-            )
+            ),
+            safetyLimitTemp: Float(safetyLimitTemp)
         )
+        monitor.onSafetyLimitBreached = { [weak self] sensorTemp, limitTemp in
+            Task { @MainActor in
+                guard let self else { return }
+                self.sensorFaultMessage = "A sensor reached \(Int(round(sensorTemp)))°C (safety limit: \(Int(round(limitTemp)))°C). Fans are locked at maximum speed."
+                self.monitorState = .safetyOverride
+                self.clearManualControl()
+                NotificationManager.shared.sendSafetyAlert(sensorTemp: sensorTemp, limitTemp: limitTemp)
+            }
+        }
         monitor.onUpdate = { [weak self] status, profile, state in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -540,17 +599,18 @@ final class AppState: ObservableObject {
         monitor.onFanCommand = { [weak self] command in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                let isSafetyCommand = command == .safetyMax
                 // Don't fight a CLI hold — the user set it deliberately. Decide on
                 // the main actor where externalHold lives; the monitor resumes
                 // control when they pick a profile or press Default.
-                guard self.externalHold == nil else { return }
+                guard self.externalHold == nil || isSafetyCommand else { return }
                 // A profile tick can already be queued on the main actor when
                 // Apply is clicked. Drop it while testing or releasing control.
                 // The emergency reset must always be allowed through.
                 if self.monitor?.isControlFaultLatched == true {
-                    guard command == .resetAuto else { return }
+                    guard command == .resetAuto || isSafetyCommand else { return }
                 } else if self.manualRequestID != nil || self.resettingFans {
-                    return
+                    guard isSafetyCommand else { return }
                 }
                 // Hand off to the coalescing pump; the blocking socket write happens
                 // OFF the main thread. During a ramp these fire up to ~10x/sec;
@@ -569,7 +629,7 @@ final class AppState: ObservableObject {
     /// before an explicit profile selection resumes automatic control.
     @discardableResult
     private func seizeControl() -> Bool {
-        let had = externalHold != nil || manualRequestID != nil
+        let had = externalHold != nil || manualRequestID != nil || monitor?.isSafetyLockedAtMax == true
         externalHold = nil
         clearManualControl()
         return had

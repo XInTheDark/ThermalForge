@@ -118,11 +118,28 @@ public struct DaemonHoldState: Codable, Equatable {
     /// `command` still reflects what the USER asked for (e.g. "set 2000"), never "max",
     /// so the app can say "held at 2000 — temporarily maxed for safety".
     public let safetySuspended: Bool
+    /// True when the daemon is holding fans at max because the thermal safety
+    /// latch was explicitly engaged. This remains until an explicit auto reset.
+    public let safetyLatched: Bool
 
-    public init(command: String?, owner: String, safetySuspended: Bool = false) {
+    public init(command: String?, owner: String, safetySuspended: Bool = false,
+                safetyLatched: Bool = false) {
         self.command = command
         self.owner = owner
         self.safetySuspended = safetySuspended
+        self.safetyLatched = safetyLatched
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case command, owner, safetySuspended, safetyLatched
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        command = try container.decodeIfPresent(String.self, forKey: .command)
+        owner = try container.decode(String.self, forKey: .owner)
+        safetySuspended = try container.decodeIfPresent(Bool.self, forKey: .safetySuspended) ?? false
+        safetyLatched = try container.decodeIfPresent(Bool.self, forKey: .safetyLatched) ?? false
     }
 
     public var isEmpty: Bool { owner == "none" }
@@ -238,11 +255,11 @@ private enum HoldState {
         }
     }
 
-    func snapshot(safetySuspended: Bool = false) -> DaemonHoldState {
+    func snapshot(safetySuspended: Bool = false, safetyLatched: Bool = false) -> DaemonHoldState {
         switch self {
-        case .none: return DaemonHoldState(command: nil, owner: "none", safetySuspended: safetySuspended)
-        case .unsupervised(let c): return DaemonHoldState(command: c, owner: "cli", safetySuspended: safetySuspended)
-        case .supervised(let c, _): return DaemonHoldState(command: c, owner: "app", safetySuspended: safetySuspended)
+        case .none: return DaemonHoldState(command: nil, owner: "none", safetySuspended: safetySuspended, safetyLatched: safetyLatched)
+        case .unsupervised(let c): return DaemonHoldState(command: c, owner: "cli", safetySuspended: safetySuspended, safetyLatched: safetyLatched)
+        case .supervised(let c, _): return DaemonHoldState(command: c, owner: "app", safetySuspended: safetySuspended, safetyLatched: safetyLatched)
         }
     }
 }
@@ -270,8 +287,10 @@ public final class DaemonServer {
     /// Flood protection for SMC-writing verbs (`auto`/reset exempt). Guarded by rateLock.
     private var rateLimiter: RateLimiter
     private let rateLock = NSLock()
-    /// The thermal safety floor's decision logic (thresholds mirrored from FanProfile).
-    private let thermalFloor = ThermalFloor()
+    /// Configurable thermal safety floor. Guarded by stateLock.
+    private var safetyLimitTemp: Float = FanProfile.safetyTempThreshold
+    /// True after the client explicitly engaged a max-fan safety latch. Guarded by stateLock.
+    private var safetyLatched = false
     /// A temperature sampler injected by tests. When nil, the floor reads the SMC
     /// safety keys itself — per key under smcLock — so it unit-tests via ThermalFloor
     /// and runs without head-of-line blocking in production.
@@ -404,7 +423,13 @@ public final class DaemonServer {
 
                 stateLock.lock()
                 let current = hold
+                let latched = safetyLatched
                 stateLock.unlock()
+
+                // A client thermal latch is deliberately different from an
+                // ordinary app hold: keep max fan speed after the client exits
+                // until the user explicitly sends auto.
+                if latched { continue }
 
                 // ONLY a supervised hold is reverted — that's the app's crash
                 // protection: the app set fans manually and stopped checking in,
@@ -569,8 +594,17 @@ public final class DaemonServer {
         // work per tick — only a live below-max hold (or an active suspension) samples.
         stateLock.lock()
         let suspended = safetySuspended
+        let latched = safetyLatched
+        let configuredLimit = safetyLimitTemp
         let heldCommand = hold.command
         stateLock.unlock()
+
+        if latched {
+            smcLock.lock()
+            try? fanControl.setMax()
+            smcLock.unlock()
+            return
+        }
 
         guard suspended || heldCommand != nil else { return }
 
@@ -588,7 +622,7 @@ public final class DaemonServer {
             return
         }
 
-        switch thermalFloor.evaluate(temp: temp, holdCommand: heldCommand, suspended: suspended) {
+        switch ThermalFloor(threshold: configuredLimit).evaluate(temp: temp, holdCommand: heldCommand, suspended: suspended) {
         case .none:
             return
 
@@ -746,6 +780,11 @@ public final class DaemonServer {
                 return false
             }
 
+            func safetyIsLatched() -> Bool {
+                stateLock.lock(); defer { stateLock.unlock() }
+                return safetyLatched
+            }
+
             // Flood cap for SMC-writing verbs. `auto`/reset is exempt — a reset must
             // never be denied. Checked after usage validation (malformed requests
             // don't burn tokens), before the write.
@@ -753,22 +792,29 @@ public final class DaemonServer {
 
             switch request.verb {
             case .max:
-                if !allowWrite() { response = rateLimited; break }
-                if blockedByCLIHold() { response = .failure(.heldByCLI, "held by cli"); break }
+                if !request.safetyLock, !allowWrite() { response = rateLimited; break }
+                if !request.safetyLock, blockedByCLIHold() { response = .failure(.heldByCLI, "held by cli"); break }
                 // Skip the SMC write while the thermal floor holds fans at max — record
                 // the new hold to restore on cooldown, but don't drop fans while hot.
                 if !isSuspended() { try fanControl.setMax() }
                 recordHold("max")
+                if request.safetyLock {
+                    stateLock.lock(); safetyLatched = true; stateLock.unlock()
+                }
                 response = .ok()
             case .auto:
                 // Exempt from the rate cap. Also the "hand back to Apple's auto curve"
                 // path, so it clears any thermal suspension — Apple's auto handles heat.
                 try fanControl.resetAuto()
-                stateLock.lock(); hold = .none; safetySuspended = false; stateLock.unlock()
+                stateLock.lock(); hold = .none; safetySuspended = false; safetyLatched = false; stateLock.unlock()
                 response = .ok()
             case .set:
                 guard let rpm = request.rpm else {
                     response = .failure(.usage, "usage: set <rpm>")
+                    break
+                }
+                if safetyIsLatched() {
+                    response = .failure(.safetyLocked, "fans are locked at maximum by thermal safety; reset to auto first")
                     break
                 }
                 if !allowWrite() { response = rateLimited; break }
@@ -780,6 +826,10 @@ public final class DaemonServer {
             case .setfan:
                 guard let index = request.fan, let rpm = request.rpm else {
                     response = .failure(.usage, "usage: setfan <index> <rpm>")
+                    break
+                }
+                if safetyIsLatched() {
+                    response = .failure(.safetyLocked, "fans are locked at maximum by thermal safety; reset to auto first")
                     break
                 }
                 if !allowWrite() { response = rateLimited; break }
@@ -800,10 +850,19 @@ public final class DaemonServer {
                 // Current hold + owner (+ whether the thermal floor is overriding it),
                 // so the app can reflect a CLI hold rather than fight or wipe it.
                 stateLock.lock()
-                let snap = hold.snapshot(safetySuspended: safetySuspended)
+                let snap = hold.snapshot(safetySuspended: safetySuspended, safetyLatched: safetyLatched)
                 stateLock.unlock()
                 response = .stateResponse(snap)
             case .heartbeat:
+                if let requestedLimit = request.safetyLimitTemp {
+                    guard requestedLimit.isFinite else {
+                        response = .failure(.usage, "safety limit must be finite")
+                        break
+                    }
+                    stateLock.lock()
+                    safetyLimitTemp = min(max(requestedLimit, 85.0), 115.0)
+                    stateLock.unlock()
+                }
                 // Refreshes a SUPERVISED hold's liveness only. On an unsupervised CLI
                 // hold this is deliberately a no-op — the app checking in must NOT
                 // convert a CLI hold into a supervised one (the v0.1.5 bug).

@@ -17,16 +17,21 @@ import Foundation
 
 public enum FanCommand: Equatable {
     case setMax
+    /// Set maximum speed and keep the daemon from watchdog-resetting it after
+    /// the app exits. Only the thermal safety path should emit this command.
+    case safetyMax
     case setRPM(Float)
     case setFan(index: Int, rpm: Float)
     case resetAuto
+    /// Synchronize the app's configurable safety threshold with the daemon.
+    case setSafetyLimit(Float)
 
     /// A hold keeps fans at a manual setting (so an unsupervised one-shot could
     /// be reverted by the watchdog); resetAuto hands control back and isn't held.
     public var isHold: Bool {
         switch self {
-        case .setMax, .setRPM, .setFan: return true
-        case .resetAuto: return false
+        case .setMax, .safetyMax, .setRPM, .setFan: return true
+        case .resetAuto, .setSafetyLimit: return false
         }
     }
 
@@ -62,6 +67,8 @@ public final class ThermalMonitor {
     public private(set) var latestStatus: ThermalStatus?
     public private(set) var filteredPeakTemp: Float?
     public private(set) var temperatureFilter: TemperatureFilter
+    public private(set) var safetyLimitTemp: Float
+    public private(set) var isSafetyLockedAtMax: Bool = false
 
     // MARK: - Tick Timing
 
@@ -127,6 +134,7 @@ public final class ThermalMonitor {
     public var onUpdate: ((ThermalStatus, FanProfile, MonitorState) -> Void)?
     public var onPowerSourceUpdate: ((PowerSourceState) -> Void)?
     public var onSensorFault: ((String) -> Void)?
+    public var onSafetyLimitBreached: ((Float, Float) -> Void)?
     /// Called when a fan command needs to be executed (may require privilege)
     public var onFanCommand: ((FanCommand) throws -> Void)?
 
@@ -137,7 +145,8 @@ public final class ThermalMonitor {
                 adapterTransform: FanPercentTransform = .adapterDefault,
                 sensorRefreshInterval: TimeInterval = 1.0,
                 controlLoopInterval: TimeInterval = 0.1,
-                temperatureFilter: TemperatureFilter = TemperatureFilter()) {
+                temperatureFilter: TemperatureFilter = TemperatureFilter(),
+                safetyLimitTemp: Float = FanProfile.safetyTempThreshold) {
         self.fanControl = fanControl
         self.activeProfile = profile
         self.batteryProfile = batteryProfile ?? profile
@@ -147,6 +156,7 @@ public final class ThermalMonitor {
         self.tickInterval = max(controlLoopInterval, 0.05)
         self.sensorRefreshInterval = max(sensorRefreshInterval, self.tickInterval)
         self.temperatureFilter = temperatureFilter
+        self.safetyLimitTemp = min(max(safetyLimitTemp, 85.0), 115.0)
     }
 
     // MARK: - Lifecycle
@@ -199,6 +209,24 @@ public final class ThermalMonitor {
         }
     }
 
+    /// Update safety upper limit temperature threshold.
+    public func updateSafetyLimit(_ temp: Float) {
+        queue.async {
+            self.safetyLimitTemp = min(max(temp, 85.0), 115.0)
+        }
+    }
+
+    /// Restore a daemon-reported safety latch when the app starts after the
+    /// original app instance exited or lost its heartbeat.
+    public func restoreSafetyLock() {
+        queue.async {
+            self.isSafetyLockedAtMax = true
+            self.state = .safetyOverride
+            self.fansCurrentlyRunning = true
+            self.lastAppliedRPMPercent = 1.0
+        }
+    }
+
     /// Update the active profile.
     public func switchProfile(_ profile: FanProfile) {
         queue.async { [self] in
@@ -207,6 +235,7 @@ public final class ThermalMonitor {
             sensorFaultLatched = false
             lastSuccessfulTickUptime = nil
             healthLock.unlock()
+            isSafetyLockedAtMax = false
             activeProfile = profile
             lastAppliedRPMPercent = 0
             fansCurrentlyRunning = false
@@ -281,7 +310,7 @@ public final class ThermalMonitor {
             self.healthLock.lock()
             let faulted = self.sensorFaultLatched
             self.healthLock.unlock()
-            guard !faulted, !self.manualControlActive else { return }
+            guard !faulted, !self.manualControlActive, !self.isSafetyLockedAtMax else { return }
             self.lastAppliedRPMPercent = 0
             self.fansCurrentlyRunning = false
             self.isRampingDown = false
@@ -315,7 +344,9 @@ public final class ThermalMonitor {
         healthLock.unlock()
         TFLogger.shared.error("Thermal control suspended: \(reason)")
         onSensorFault?(reason)
-        applyCommand(.resetAuto)
+        if !isSafetyLockedAtMax {
+            applyCommand(.resetAuto)
+        }
     }
 
     private func triggerSensorFault(_ reason: String) {
@@ -330,6 +361,7 @@ public final class ThermalMonitor {
             self.sensorFaultLatched = false
             self.lastSuccessfulTickUptime = nil
             self.healthLock.unlock()
+            self.isSafetyLockedAtMax = false
             self.state = .idle
         }
     }
@@ -377,8 +409,19 @@ public final class ThermalMonitor {
         let effectiveTemp = temperatureFilter.update(rawTemp: maxTemp, timeConstant: timeConstant, nowUptime: now)
         filteredPeakTemp = effectiveTemp
 
-        if manualControlActive, maxTemp >= FanProfile.safetyTempThreshold {
-            triggerSensorFault("temperature reached the safety limit during manual testing")
+        let anySensorMax = status.temperatures.values.max() ?? maxTemp
+        if manualControlActive, anySensorMax >= safetyLimitTemp {
+            applyCommand(.safetyMax)
+            state = .safetyOverride
+            isSafetyLockedAtMax = true
+            fansCurrentlyRunning = true
+            lastAppliedRPMPercent = 1.0
+            TFLogger.shared.safety(
+                "Safety limit reached during manual testing: \(String(format: "%.1f", anySensorMax))°C ≥ \(Int(safetyLimitTemp))°C — locking fans at max"
+            )
+            onSafetyLimitBreached?(anySensorMax, safetyLimitTemp)
+            emitUpdateIfDue(status: status, now: now)
+            markControlTickHealthy(now)
             return
         }
 
@@ -388,31 +431,66 @@ public final class ThermalMonitor {
             lastMonitorUptime = now
         }
 
-        // Safety override: any sensor > 95°C
-        if maxTemp >= FanProfile.safetyTempThreshold {
-            if state != .safetyOverride {
-                applyCommand(.setMax)
+        // If safety failure is latched, keep fans locked at max RPM
+        if isSafetyLockedAtMax {
+            if state != .safetyOverride || !fansCurrentlyRunning || lastAppliedRPMPercent < 1.0 {
+                applyCommand(.safetyMax)
                 state = .safetyOverride
                 fansCurrentlyRunning = true
                 lastAppliedRPMPercent = 1.0
-                TFLogger.shared.safety("Override triggered: \(String(format: "%.1f", maxTemp))°C — fans maxed")
             }
             emitUpdateIfDue(status: status, now: now)
             markControlTickHealthy(now)
             return
         }
 
-        // Clear safety override with hysteresis
-        if state == .safetyOverride
-            && maxTemp < FanProfile.safetyTempThreshold - FanProfile.hysteresisDegrees
-        {
-            state = .idle
-        }
-
         if manualControlActive {
             emitUpdateIfDue(status: status, now: now)
             markControlTickHealthy(now)
             return
+        }
+
+        // --- Parallel Safety Limit & Profile Calculation ---
+        let upperLimitDemand: Float = (anySensorMax >= safetyLimitTemp) ? 1.0 : 0.0
+        let profileTarget = calculateProfileTargetPercent(status: status, peakTemp: effectiveTemp)
+
+        let delta = upperLimitDemand - profileTarget
+        if delta >= 0.10 {
+            // Upper limit breached and exceeds profile output by at least 10%:
+            // 1. Trigger upper limit (100% fans)
+            // 2. Lock at max fan (latched failure)
+            // 3. Dispatch alert
+            applyCommand(.safetyMax)
+            state = .safetyOverride
+            isSafetyLockedAtMax = true
+            fansCurrentlyRunning = true
+            lastAppliedRPMPercent = 1.0
+            TFLogger.shared.safety(
+                "Upper safety limit breached: \(String(format: "%.1f", anySensorMax))°C ≥ \(Int(safetyLimitTemp))°C " +
+                "(profile target: \(Int(profileTarget * 100))%, delta: \(Int(delta * 100))% ≥ 10%) — locking fans at max"
+            )
+            onSafetyLimitBreached?(anySensorMax, safetyLimitTemp)
+            emitUpdateIfDue(status: status, now: now)
+            markControlTickHealthy(now)
+            return
+        } else if anySensorMax >= safetyLimitTemp {
+            // Reached safety limit, but profile is already commanding >= 90%
+            if state != .safetyOverride {
+                applyCommand(.setMax)
+                state = .safetyOverride
+                fansCurrentlyRunning = true
+                lastAppliedRPMPercent = 1.0
+                TFLogger.shared.safety("Safety limit reached: \(String(format: "%.1f", anySensorMax))°C — fans maxed")
+            }
+            emitUpdateIfDue(status: status, now: now)
+            markControlTickHealthy(now)
+            return
+        }
+
+        if state == .safetyOverride && !isSafetyLockedAtMax
+            && anySensorMax < safetyLimitTemp - FanProfile.hysteresisDegrees
+        {
+            state = .idle
         }
 
         // Sustained trigger: track consecutive ticks above start threshold.
@@ -515,9 +593,47 @@ public final class ThermalMonitor {
 
     // MARK: - Curve-Based Profiles
 
+    /// Calculate the steady target percentage (0.0–1.0) for the active profile without ramp governors.
+    public func calculateProfileTargetPercent(status: ThermalStatus, peakTemp: Float) -> Float {
+        let curve = activeProfile.curve
+        if curve.handsOff { return 0 }
+        if curve.alwaysOn { return curve.maxRPMPercent }
+
+        let batteryTemp = status.temperatures.filter { $0.key.hasPrefix("TB") }.values.max()
+        let batteryPressure = batteryTemp.map(FanProfile.batteryCoolingTarget) ?? 0
+
+        guard let curveTarget = curve.targetPercent(at: peakTemp, fansCurrentlyRunning: fansCurrentlyRunning) ?? (batteryPressure > 0 ? batteryPressure : nil) else {
+            return 0
+        }
+
+        let sustainedTicksNeeded = Int(curve.sustainedTriggerSec / Float(tickInterval))
+        if !fansCurrentlyRunning && sustainedAboveCount < sustainedTicksNeeded {
+            return 0
+        }
+
+        let minRPM = status.fans.first.map { Float($0.minRPM) } ?? 2317
+        let maxRPM = status.fans.first.map { Float($0.maxRPM) } ?? 7826
+        var targetPct = curveTarget <= 0.001 ? minRPM / maxRPM : curveTarget
+
+        if let calibrated = calibration?.fanPercentForTemp(peakTemp) { targetPct = calibrated }
+        if targetPct > 0, curve.rateOfChangeBoost > 0 {
+            let rate = rateOfChange()
+            if rate > 0 { targetPct += rate * curve.rateOfChangeBoost }
+        }
+        if peakTemp >= curve.ceilingTemp { targetPct = curve.maxRPMPercent }
+
+        if batteryTemp != nil, batteryPressure > 0 {
+            targetPct = max(targetPct, batteryPressure)
+        }
+
+        let transform = usingExternalPower ? adapterTransform : batteryTransform
+        targetPct = transform.apply(to: targetPct)
+
+        return min(max(targetPct, 0), curve.maxRPMPercent)
+    }
+
     private func tickCurve(status: ThermalStatus, peakTemp: Float, sampleHistory: Bool) {
         let curve = activeProfile.curve
-        let transform = usingExternalPower ? adapterTransform : batteryTransform
         let maxRPM = status.fans.first.map { Float($0.maxRPM) } ?? 7826
         let minRPM = status.fans.first.map { Float($0.minRPM) } ?? 2317
 
@@ -540,10 +656,8 @@ public final class ThermalMonitor {
 
         let batteryTemp = status.temperatures.filter { $0.key.hasPrefix("TB") }.values.max()
         let batteryPressure = batteryTemp.map(FanProfile.batteryCoolingTarget) ?? 0
-
-        // Get target from the shared curve math. Battery pressure can engage the
-        // fans even while CPU/GPU temperature is below the profile start point.
         let curveTarget = curve.targetPercent(at: peakTemp, fansCurrentlyRunning: fansCurrentlyRunning)
+
         if curveTarget == nil && batteryPressure <= 0 {
             // Curve says fans should be off
             if fansCurrentlyRunning {
@@ -556,10 +670,7 @@ public final class ThermalMonitor {
             }
             return
         }
-        let rawTarget = curveTarget ?? batteryPressure
 
-        // Sustained trigger: per-profile duration.
-        // Converted to tick count at runtime based on tick interval.
         let sustainedTicksNeeded = Int(curve.sustainedTriggerSec / Float(tickInterval))
         if !fansCurrentlyRunning && sustainedAboveCount < sustainedTicksNeeded {
             if sustainedAboveCount == 1 {
@@ -568,24 +679,7 @@ public final class ThermalMonitor {
             return
         }
 
-        // 0.001 signals "keep at minimum" (hysteresis band)
-        var targetPct = rawTarget <= 0.001 ? minRPM / maxRPM : rawTarget
-        if let calibrated = calibration?.fanPercentForTemp(peakTemp) { targetPct = calibrated }
-        if targetPct > 0, curve.rateOfChangeBoost > 0 {
-            let rate = rateOfChange()
-            if rate > 0 { targetPct += rate * curve.rateOfChangeBoost }
-        }
-        if peakTemp >= curve.ceilingTemp { targetPct = curve.maxRPMPercent }
-
-        // Battery packs are kept below a conservative 40°C target. The SMC
-        // battery sensor is advisory; CPU/GPU safety override remains separate.
-        if batteryTemp != nil, batteryPressure > 0 {
-            targetPct = max(targetPct, batteryPressure)
-        }
-
-        targetPct = transform.apply(to: targetPct)
-
-        // Clamp to valid range
+        var targetPct = calculateProfileTargetPercent(status: status, peakTemp: peakTemp)
         targetPct = min(max(targetPct, minRPM / maxRPM), curve.maxRPMPercent)
 
         // Ramp governors — per-profile rates, per-tick amounts

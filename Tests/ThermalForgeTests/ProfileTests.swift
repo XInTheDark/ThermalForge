@@ -18,8 +18,8 @@ struct ProfileTests {
         let profile = FanProfile.default
         #expect(profile.name == "Default")
         #expect(profile.curve.stopTemp == 50)
-        #expect(profile.curve.startTemp == 53)
-        #expect(profile.curve.ceilingTemp == 80)
+        #expect(profile.curve.startTemp == 55)
+        #expect(profile.curve.ceilingTemp == 92)
         #expect(profile.curve.maxRPMPercent == 1)
         #expect(profile.curve.curveShape == .sCurve)
         #expect(profile.curve.sustainedTriggerSec == 2)
@@ -32,11 +32,13 @@ struct ProfileTests {
         #expect(curve.targetPercent(at: 45, fansCurrentlyRunning: false) == nil)
         #expect(curve.targetPercent(at: 52, fansCurrentlyRunning: false) == nil)
         #expect(curve.targetPercent(at: 52, fansCurrentlyRunning: true) == 0.001)
-        #expect(curve.targetPercent(at: 80, fansCurrentlyRunning: true) == 1)
+        #expect(curve.targetPercent(at: 92, fansCurrentlyRunning: true) == 1)
         #expect(curve.displayPercent(at: 50) == 0)
-        #expect(curve.displayPercent(at: 80) == 1)
-        #expect(curve.displayPercent(at: 66.5) > 0.4)
-        #expect(curve.displayPercent(at: 66.5) < 0.6)
+        #expect(curve.displayPercent(at: 92) == 1)
+        #expect(curve.displayPercent(at: 73.5) > 0.45)
+        #expect(curve.displayPercent(at: 73.5) < 0.55)
+        #expect(curve.displayPercent(at: 80) > 0.70)
+        #expect(curve.displayPercent(at: 80) < 0.80)
     }
 
     @Test("Curve JSON remains backward compatible")
@@ -54,7 +56,7 @@ struct ProfileTests {
 
     @Test("Safety constants remain conservative")
     func safety() {
-        #expect(FanProfile.safetyTempThreshold == 95)
+        #expect(FanProfile.safetyTempThreshold == 105)
         #expect(FanProfile.hysteresisDegrees == 5)
         #expect(FanProfile.batteryCoolingTarget(for: 37) == 0)
         #expect(FanProfile.batteryCoolingTarget(for: 38) == 0)

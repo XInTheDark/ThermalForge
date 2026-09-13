@@ -69,6 +69,14 @@ struct FanCommandPumpTests {
         #expect(out == [.setRPM(1000), .setRPM(4000)])
     }
 
+    @Test("consecutive safety-limit updates collapse latest-wins")
+    func consecutiveSafetyLimitCollapse() {
+        let out = run(first: .setSafetyLimit(100),
+                      burst: [.setSafetyLimit(101), .setSafetyLimit(102), .setSafetyLimit(103)],
+                      expected: 2)
+        #expect(out == [.setSafetyLimit(100), .setSafetyLimit(103)])
+    }
+
     @Test("resetAuto is never dropped and never reordered behind a later setRPM")
     func resetAutoPreserved() {
         let out = run(first: .setRPM(1000),

@@ -222,7 +222,7 @@ extension FanProfile {
     public static let `default` = FanProfile(
         id: "default",
         name: "Default",
-        curve: Curve(stopTemp: 50, startTemp: 53, ceilingTemp: 80,
+        curve: Curve(stopTemp: 50, startTemp: 55, ceilingTemp: 92,
                      maxRPMPercent: 1.0, curveShape: .sCurve,
                      rampUpPerSec: 0.12, rampDownPerSec: 0.05,
                      sustainedTriggerSec: 2, rateOfChangeBoost: 0.15)
@@ -291,7 +291,7 @@ extension FanProfile {
 
 extension FanProfile {
     /// Hard safety threshold — overrides any profile
-    public static let safetyTempThreshold: Float = 95.0
+    public static let safetyTempThreshold: Float = 105.0
     /// Hysteresis deadband to prevent oscillation
     public static let hysteresisDegrees: Float = 5.0
     /// Conservative battery cooling target: begin increasing fan demand at 38°C

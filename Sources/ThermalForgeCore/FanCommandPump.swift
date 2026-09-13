@@ -54,7 +54,7 @@ public final class FanCommandPump: @unchecked Sendable {
     /// the newest keeps the fans tracking the CURRENT target instead of replaying a
     /// stale ramp. Off-main already prevents the UI freeze; this bounds queue depth.
     ///
-    /// The other three command kinds are NEVER coalesced or reordered — each is a
+    /// The other command kinds are NEVER coalesced or reordered — each is a
     /// discrete mode change, not a point on a continuum:
     ///   - `.resetAuto` hands control back to macOS; dropping it would strand the
     ///     fans in manual, and letting a later setRPM jump ahead would re-pin fans
@@ -63,17 +63,28 @@ public final class FanCommandPump: @unchecked Sendable {
     ///     RPM would silently lose the max request.
     ///   - `.setFan` targets ONE fan by index; a whole-system setRPM cannot stand in
     ///     for it, nor it for a setRPM.
+    ///   - `.setSafetyLimit` is coalesced with the latest adjacent threshold update,
+    ///     so dragging the preferences slider does not queue stale daemon writes.
     public func submit(_ command: FanCommand, onComplete: Completion? = nil) {
         lock.lock()
-        if onComplete == nil, case .setRPM = command,
-           let last = pending.last, last.done == nil, case .setRPM = last.command {
-            pending[pending.count - 1] = (command, nil)   // coalesce consecutive setRPM
+        if onComplete == nil, let last = pending.last, last.done == nil,
+           canCoalesce(command, with: last.command) {
+            pending[pending.count - 1] = (command, nil)   // coalesce the latest adjacent update
         } else {
             pending.append((command, onComplete))
         }
         lock.unlock()
 
         queue.async { [weak self] in self?.drain() }
+    }
+
+    private func canCoalesce(_ command: FanCommand, with previous: FanCommand) -> Bool {
+        switch (command, previous) {
+        case (.setRPM, .setRPM), (.setSafetyLimit, .setSafetyLimit):
+            return true
+        default:
+            return false
+        }
     }
 
     /// Drain pending writes in order. Only one drain runs at a time (the queue is

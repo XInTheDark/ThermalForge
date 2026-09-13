@@ -45,7 +45,7 @@ struct DaemonProtocolTests {
             DaemonRequest(verb: .setfan, rpm: 2500, fan: 1, oneshot: true),
             DaemonRequest(verb: .status),
             DaemonRequest(verb: .state),
-            DaemonRequest(verb: .heartbeat),
+            DaemonRequest(verb: .heartbeat, safetyLimitTemp: 110),
             DaemonRequest(verb: .version),
         ]
         for req in requests {
@@ -62,12 +62,14 @@ struct DaemonProtocolTests {
             .ok(appliedRPM: 2500),
             .failure(.usage, "usage: set <rpm>"),
             .failure(.heldByCLI, "held by cli"),
+            .failure(.safetyLocked, "fans are locked at maximum by thermal safety; reset to auto first"),
             .failure(.rateLimited, "too many fan commands; try again shortly"),
             .failure(.internal, "smc write failed"),
             .versionResponse("0.1.10"),
             .statusResponse(#"{"fans":[],"temperatures":{}}"#),
             .stateResponse(DaemonHoldState(command: "set 3000", owner: "cli")),
             .stateResponse(DaemonHoldState(command: "set 2000", owner: "app", safetySuspended: true)),
+            .stateResponse(DaemonHoldState(command: "max", owner: "app", safetyLatched: true)),
             .unsupported(daemonVersion: "0.1.10"),
         ]
         for resp in responses {
@@ -79,15 +81,26 @@ struct DaemonProtocolTests {
     func oneshotPreservation() throws {
         // Hold commands carry oneshot; resetAuto never does (it isn't a hold).
         #expect(DaemonRequest(.setMax, oneshot: true) == DaemonRequest(verb: .max, oneshot: true))
+        #expect(DaemonRequest(.safetyMax, oneshot: false) == DaemonRequest(verb: .max, safetyLock: true))
         #expect(DaemonRequest(.setRPM(3000), oneshot: true) == DaemonRequest(verb: .set, rpm: 3000, oneshot: true))
         #expect(DaemonRequest(.setFan(index: 1, rpm: 2500), oneshot: true)
                 == DaemonRequest(verb: .setfan, rpm: 2500, fan: 1, oneshot: true))
         #expect(DaemonRequest(.resetAuto, oneshot: true).oneshot == false)
         #expect(DaemonRequest(.setMax, oneshot: false).oneshot == false)
+        #expect(DaemonRequest(.setSafetyLimit(110), oneshot: false)
+                == DaemonRequest(verb: .heartbeat, safetyLimitTemp: 110))
 
         // And the flag survives a frame round-trip either way.
         #expect(try roundTrip(DaemonRequest(.setMax, oneshot: true), max: DaemonProtocol.maxRequestBytes).oneshot == true)
         #expect(try roundTrip(DaemonRequest(.setRPM(1200), oneshot: false), max: DaemonProtocol.maxRequestBytes).oneshot == false)
+    }
+
+    @Test("older framed requests decode with new safety fields at defaults")
+    func legacyRequestDefaults() throws {
+        let data = Data(#"{"v":1,"verb":"heartbeat","oneshot":false}"#.utf8)
+        let request = try DaemonProtocol.decode(DaemonRequest.self, from: data)
+        #expect(request.safetyLock == false)
+        #expect(request.safetyLimitTemp == nil)
     }
 
     @Test("an unknown verb fails to decode (daemon maps this to unsupportedVersion)")

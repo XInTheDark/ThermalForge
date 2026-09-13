@@ -115,6 +115,33 @@ struct PreferencesView: View {
 
             Divider()
 
+            // Thermal Safety Limit
+            VStack(alignment: .leading, spacing: 8) {
+                Text("THERMAL SAFETY LIMIT")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.secondary)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Upper limit threshold")
+                            .font(.subheadline)
+                        Spacer()
+                        Text(formatSafetyLimit(appState.safetyLimitTemp))
+                            .font(.system(.subheadline, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(value: $appState.safetyLimitTemp, in: 90.0...115.0, step: 1.0)
+                }
+
+                Text("If any sensor reaches this limit and exceeds the profile output by ≥10%, fans immediately lock at 100% maximum RPM and trigger a desktop alert. Default: 105°C.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider()
+
             // General
             VStack(alignment: .leading, spacing: 8) {
                 Text("GENERAL")
@@ -130,7 +157,16 @@ struct PreferencesView: View {
             Spacer()
         }
         .padding(20)
-        .frame(width: 420, height: 550)
+        .frame(width: 420, height: 630)
+    }
+
+    private func formatSafetyLimit(_ tempC: Double) -> String {
+        if appState.useFahrenheit {
+            let tempF = Int(round(tempC * 9 / 5 + 32))
+            return "\(tempF) °F"
+        } else {
+            return "\(Int(round(tempC))) °C"
+        }
     }
 
     private func formatSensorInterval(_ interval: Double) -> String {

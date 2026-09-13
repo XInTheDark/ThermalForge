@@ -20,6 +20,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             TFLogger.shared.error("Another instance already running — quitting")
             NSApp.terminate(nil)
         }
+
+        NotificationManager.shared.requestAuthorization()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -30,7 +32,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // the process is exiting, so an async write would be dropped; both calls are
         // bounded by the sendRaw timeout.
         let client = DaemonClient()
-        if let state = try? client.readState(), state.owner == "app" {
+        if let state = try? client.readState(), state.owner == "app", !state.safetyLatched {
             _ = try? client.execute(.resetAuto)
         }
         // owner == "cli" → leave the CLI hold alone; owner == "none" → nothing to reset.

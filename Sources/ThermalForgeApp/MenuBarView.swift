@@ -341,15 +341,26 @@ private struct FanCurvePreview: View {
 private struct SensorFaultBanner: View {
     let reason: String
 
+    private var isLockedAtMax: Bool {
+        reason.contains("locked at maximum")
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Label("Thermal monitoring stopped", systemImage: "exclamationmark.triangle.fill")
+            Label(isLockedAtMax ? "Fans locked at maximum" : "Thermal monitoring stopped", systemImage: "exclamationmark.triangle.fill")
                 .font(.caption.bold())
                 .foregroundStyle(.red)
-            Text("ThermalForge handed fan control back to macOS because \(reason). It will stay in Apple Auto until you choose a profile again.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            if isLockedAtMax {
+                Text("\(reason) Press Default below (or select a profile) to reset.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("ThermalForge handed fan control back to macOS because \(reason). It will stay in Apple Auto until you choose a profile again.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
