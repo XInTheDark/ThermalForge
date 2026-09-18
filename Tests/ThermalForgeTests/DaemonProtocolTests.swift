@@ -53,6 +53,16 @@ struct DaemonProtocolTests {
         }
     }
 
+    @Test("Writing to a disconnected peer reports a frame error instead of terminating")
+    func disconnectedPeerWrite() throws {
+        let (client, peer) = socketPair()
+        close(peer)
+        defer { close(client) }
+        #expect(throws: DaemonProtocol.FrameError.write) {
+            try DaemonProtocol.writeFrame(client, [0, 0, 0, 1, 0])
+        }
+    }
+
     @Test("every response shape round-trips through a frame")
     func responseRoundTrip() throws {
         let responses: [DaemonResponse] = [

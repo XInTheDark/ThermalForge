@@ -283,6 +283,9 @@ public final class FanControl: ThermalStatusSource {
     /// On M1-M4: writes Ftst=1, then polls until mode write succeeds.
     /// On M5+: Ftst doesn't exist, attempts direct mode write.
     private func unlockFans(count: Int) throws {
+        // The transport budget covers one acquisition, not ten seconds per fan.
+        // Share the deadline so a multi-fan machine cannot outlive its request.
+        let deadline = Date().addingTimeInterval(10.0)
         if hasFtst {
             // M1-M4 path: Ftst unlock suppresses thermalmonitord
             guard smc.writeKey(SMCFanKey.forceTest, bytes: [1]) else {
@@ -296,7 +299,6 @@ public final class FanControl: ThermalStatusSource {
         // Set each fan to manual mode
         for i in 0..<count {
             let modeKey = SMCFanKey.key(modeKeyTemplate, fan: i)
-            let deadline = Date().addingTimeInterval(10.0)
             var success = false
 
             while Date() < deadline {

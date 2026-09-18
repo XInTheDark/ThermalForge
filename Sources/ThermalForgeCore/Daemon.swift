@@ -159,7 +159,12 @@ public struct FanApplyResult: Equatable {
 }
 
 public final class DaemonClient {
-    public init() {}
+    private let socketPath: String
+
+    public init() { socketPath = ThermalForgeDaemon.socketPath }
+
+    /// Connect to an isolated test server without touching the hardware daemon.
+    init(socketPath: String) { self.socketPath = socketPath }
 
     /// Read the daemon's current hold (what's set and who owns it) so the menu
     /// bar app can reflect a CLI hold instead of fighting or wiping it.
@@ -178,7 +183,8 @@ public final class DaemonClient {
     ///   No effect on resetAuto (nothing to hold).
     @discardableResult
     public func execute(_ command: FanCommand, oneshot: Bool = false) throws -> FanApplyResult {
-        let response = try request(DaemonRequest(command, oneshot: oneshot))
+        let timeout = command.isHold ? DaemonProtocol.fanCommandTimeout : 2.0
+        let response = try request(DaemonRequest(command, oneshot: oneshot), timeout: timeout)
         guard response.ok else {
             throw DaemonError.commandFailed(
                 response.message ?? response.error.map { String(describing: $0) } ?? "daemon error"
@@ -199,8 +205,8 @@ public final class DaemonClient {
 
         // Bound every send/recv so a hung or contended daemon can never block the
         // caller indefinitely — the v0.1.7 freeze. Healthy round-trips here are
-        // sub-millisecond (heartbeat/version/state) to low-single-digit ms; 2s is a
-        // stall cutoff with wide margin over the heaviest real reply.
+        // sub-millisecond (heartbeat/version/state). Fan commands use a longer
+        // bounded timeout because acquiring manual mode can take ten seconds.
         let whole = Int(timeout)
         var tv = timeval(tv_sec: whole, tv_usec: Int32((timeout - Double(whole)) * 1_000_000))
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
@@ -208,7 +214,7 @@ public final class DaemonClient {
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        setPath(&addr, ThermalForgeDaemon.socketPath)
+        setPath(&addr, socketPath)
 
         // connect() must ALSO be bounded, not just read/write. A wedged daemon
         // (accept loop stalled in a slow handleClient, listen backlog full) makes a

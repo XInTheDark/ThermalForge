@@ -3,7 +3,7 @@
 //  ThermalForge
 //
 //  Phase 4 connection layer: concurrent, bounded accept + one framed request/response
-//  per connection over DispatchIO, with a ~1s header deadline and a ~5s full-request
+//  per connection over DispatchIO, with a ~1s header deadline and a bounded request
 //  deadline (replacing Phase 0's SO_RCVTIMEO). Decoupled from DaemonServer so it can be
 //  tested against a plain bound AF_UNIX socket — the daemon's request processing is
 //  injected as `handle`. Framing-level replies (legacy peer, oversized) live here; the
@@ -30,7 +30,7 @@ final class ConnectionServer: @unchecked Sendable {
     init(listenFD: Int32,
          maxConnections: Int = 8,
          headerDeadline: TimeInterval = 1.0,
-         requestDeadline: TimeInterval = 5.0,
+         requestDeadline: TimeInterval = DaemonProtocol.fanCommandTimeout,
          handle: @escaping (Data) -> DaemonResponse) {
         self.listenFD = listenFD
         self.maxConnections = maxConnections
@@ -49,6 +49,12 @@ final class ConnectionServer: @unchecked Sendable {
             while activeConnections < maxConnections {
                 let clientFD = accept(listenFD, nil, nil)
                 if clientFD < 0 { break }   // EAGAIN (no more pending) or error
+                do {
+                    try DaemonProtocol.suppressBrokenPipeSignal(clientFD)
+                } catch {
+                    close(clientFD)
+                    continue
+                }
                 activeConnections += 1
                 handleConnection(clientFD)
             }

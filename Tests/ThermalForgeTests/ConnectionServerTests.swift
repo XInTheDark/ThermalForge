@@ -46,6 +46,58 @@ struct ConnectionServerTests {
         return fd
     }
 
+    @Test("A client disconnecting before the reply does not kill the server or leak its slot")
+    func disconnectedClient() throws {
+        let path = "/tmp/tf-disconnect-\(UUID().uuidString).sock"
+        let listenFD = bindListener(path)
+        defer { close(listenFD); unlink(path) }
+        let entered = DispatchSemaphore(value: 0)
+        let reply = DispatchSemaphore(value: 0)
+        let server = ConnectionServer(listenFD: listenFD, maxConnections: 1) { _ in
+            entered.signal()
+            _ = reply.wait(timeout: .now() + 3)
+            return .versionResponse("served")
+        }
+        server.start()
+
+        let frame = try DaemonProtocol.encodeFrame(DaemonRequest(verb: .version),
+                                                   max: DaemonProtocol.maxRequestBytes)
+        let abandoned = connectClient(path)
+        try DaemonProtocol.writeFrame(abandoned, frame)
+        let started = entered.wait(timeout: .now() + 2)
+        shutdown(abandoned, SHUT_RDWR)
+        close(abandoned)
+        reply.signal()
+        try #require(started == .success)
+
+        // With one connection slot, this can only finish if the failed response
+        // releases the abandoned connection and the server survives the write.
+        let client = connectClient(path)
+        defer { close(client) }
+        var tv = timeval(tv_sec: 3, tv_usec: 0)
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        try DaemonProtocol.writeFrame(client, frame)
+        reply.signal()
+        let body = try DaemonProtocol.readFrame(client, max: DaemonProtocol.maxResponseBytes)
+        let response = try DaemonProtocol.decode(DaemonResponse.self, from: body)
+        #expect(response.version == "served")
+    }
+
+    @Test("Fan commands wait for mode acquisition beyond the old client and server deadlines")
+    func slowFanCommand() throws {
+        let path = "/tmp/tf-slow-command-\(UUID().uuidString).sock"
+        let listenFD = bindListener(path)
+        defer { close(listenFD); unlink(path) }
+        let server = ConnectionServer(listenFD: listenFD) { _ in
+            Thread.sleep(forTimeInterval: 5.2)
+            return .ok(appliedRPM: 2317)
+        }
+        server.start()
+
+        let result = try DaemonClient(socketPath: path).execute(.setRPM(2317))
+        #expect(result.appliedRPM == 2317)
+    }
+
     @Test("8 connect-and-hang sockets don't starve a real request — served within ~1s")
     func floodThenRealRequest() throws {
         let path = "/tmp/tf-conn-test.sock"

@@ -21,6 +21,10 @@ public enum DaemonProtocol {
     public static let maxRequestBytes = 4 * 1024
     public static let maxResponseBytes = 64 * 1024
 
+    /// Fan mode acquisition can take up to ten seconds. Leave room for its
+    /// settle delay and reply without timing out a legitimate command.
+    static let fanCommandTimeout: TimeInterval = 15.0
+
     public enum FrameError: Error, Equatable {
         case oversized    // declared length exceeds the cap (genuine over-cap / hostile binary)
         case legacyPeer   // the peer is speaking the pre-Phase-2 string protocol
@@ -81,6 +85,7 @@ public enum DaemonProtocol {
 
     /// Write all of `bytes` to `fd`, looping on partial writes.
     public static func writeFrame(_ fd: Int32, _ bytes: [UInt8]) throws {
+        try suppressBrokenPipeSignal(fd)
         var sent = 0
         while sent < bytes.count {
             let n = bytes.withUnsafeBytes { p in
@@ -88,6 +93,16 @@ public enum DaemonProtocol {
             }
             guard n > 0 else { throw FrameError.write }   // 0 or -1 (incl. SO_SNDTIMEO)
             sent += n
+        }
+    }
+
+    /// A peer that times out or exits must produce a write error, not SIGPIPE
+    /// terminating the daemon/app. Also used by the server's DispatchIO sockets.
+    static func suppressBrokenPipeSignal(_ fd: Int32) throws {
+        var enabled: Int32 = 1
+        guard setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled,
+                         socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+            throw FrameError.write
         }
     }
 
