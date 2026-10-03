@@ -63,6 +63,34 @@ struct DaemonProtocolTests {
         }
     }
 
+    @Test("Only fan and status verbs wait for the SMC lock")
+    func smcVerbs() {
+        let smc = DaemonRequest.Verb.allCases.filter(\.usesSMC)
+        #expect(Set(smc) == [.max, .auto, .set, .setfan, .status])
+    }
+
+    @Test("A different installed daemon binary is detected, then cleared after reinstall")
+    func daemonBinaryCheck() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tf-binary-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let bundled = dir.appendingPathComponent("bundled")
+        let installed = dir.appendingPathComponent("installed")
+        try Data("new build".utf8).write(to: bundled)
+        try Data("old".utf8).write(to: installed)
+
+        let check = DaemonBinaryCheck(bundledPath: bundled.path, installedPath: installed.path)
+        #expect(check.installedDiffers() == true)
+
+        try FileManager.default.removeItem(at: installed)
+        try FileManager.default.copyItem(at: bundled, to: installed)
+        #expect(check.installedDiffers() == false)
+
+        try FileManager.default.removeItem(at: installed)
+        #expect(check.installedDiffers() == nil)
+    }
+
     @Test("every response shape round-trips through a frame")
     func responseRoundTrip() throws {
         let responses: [DaemonResponse] = [
@@ -91,7 +119,7 @@ struct DaemonProtocolTests {
     func oneshotPreservation() throws {
         // Hold commands carry oneshot; resetAuto never does (it isn't a hold).
         #expect(DaemonRequest(.setMax, oneshot: true) == DaemonRequest(verb: .max, oneshot: true))
-        #expect(DaemonRequest(.safetyMax, oneshot: false) == DaemonRequest(verb: .max, safetyLock: true))
+        #expect(DaemonRequest(.setMax, oneshot: false).safetyLock == false)
         #expect(DaemonRequest(.setRPM(3000), oneshot: true) == DaemonRequest(verb: .set, rpm: 3000, oneshot: true))
         #expect(DaemonRequest(.setFan(index: 1, rpm: 2500), oneshot: true)
                 == DaemonRequest(verb: .setfan, rpm: 2500, fan: 1, oneshot: true))

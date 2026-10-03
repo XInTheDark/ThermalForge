@@ -165,7 +165,6 @@ public enum FanCommandRouter {
         let fc = try FanControl()
         switch command {
         case .setMax: try fc.setMax()
-        case .safetyMax: try fc.setMax()
         case .setRPM(let rpm): try fc.setAllFans(rpm: rpm)
         case .setFan(let index, let rpm): try fc.setSpeed(fan: index, rpm: rpm)
         case .resetAuto: try fc.resetAuto()

@@ -4,298 +4,69 @@ import Testing
 
 @Suite("Profiles")
 struct ProfileTests {
-    @Test("Built-in profiles are registered and obsolete legacy ids migrate")
+    @Test("Built-in profiles are registered and legacy ids migrate")
     func registryAndMigration() {
-        #expect(FanProfile.available.count == 3)
-        #expect(FanProfile.available.map(\.id) == ["default", "silent", "aggressive"])
+        #expect(FanProfile.available.map(\.id) == ["silent", "default", "aggressive"])
+        #expect(FanProfile.available.map(\.name) == ["Quiet", "Default", "Performance"])
         #expect(FanProfile.selectable(id: nil).id == "default")
-        #expect(FanProfile.selectable(id: "default").id == "default")
-        #expect(FanProfile.selectable(id: "silent").id == "silent")
-        #expect(FanProfile.selectable(id: "aggressive").id == "aggressive")
         #expect(FanProfile.selectable(id: "system").id == "system")
-        for id in ["smart", "balanced", "performance", "max", "removed", "unknown"] {
+        for id in ["smart", "balanced", "performance", "max", "unknown"] {
             #expect(FanProfile.selectable(id: id).id == "default")
         }
     }
 
-    @Test("Default curve is proactive and data-driven")
-    func defaultCurve() {
-        let profile = FanProfile.default
-        #expect(profile.name == "Default")
-        #expect(profile.curve.stopTemp == 50)
-        #expect(profile.curve.startTemp == 55)
-        #expect(profile.curve.ceilingTemp == 92)
-        #expect(profile.curve.maxRPMPercent == 1)
-        #expect(profile.curve.curveShape == .sCurve)
-        #expect(profile.curve.sustainedTriggerSec == 5)
-        #expect(profile.curve.rateOfChangeBoost == 0.15)
+    @Test("Every curve is well formed")
+    func curvesWellFormed() {
+        for profile in FanProfile.available {
+            let curve = profile.curve
+            #expect(!curve.handsOff)
+            #expect(curve.releaseTemp < curve.engageTemp, "\(profile.name) needs hysteresis")
+            #expect(curve.points.first?.level == 0, "\(profile.name) starts at minimum RPM")
+            #expect(curve.points.last?.level == 1, "\(profile.name) reaches full speed")
+            #expect(curve.points.first?.temp == curve.engageTemp)
+            for (a, b) in zip(curve.points, curve.points.dropFirst()) {
+                #expect(a.temp < b.temp)
+                #expect(a.level <= b.level)
+            }
+            #expect(curve.targetTemp > curve.engageTemp && curve.targetTemp < curve.fullSpeedTemp)
+            #expect(curve.rampUpPerSec > curve.rampDownPerSec, "\(profile.name) should settle slower than it reacts")
+        }
     }
 
-    @Test("Silent profile prioritizes acoustic comfort and smooth transitions")
-    func silentCurve() {
-        let profile = FanProfile.silent
-        #expect(profile.name == "Silent")
-        #expect(profile.curve.stopTemp == 60)
-        #expect(profile.curve.startTemp == 65)
-        #expect(profile.curve.ceilingTemp == 96)
-        #expect(profile.curve.maxRPMPercent == 1)
-        #expect(profile.curve.curveShape == .easeIn)
-        #expect(profile.curve.sustainedTriggerSec == 10)
-        #expect(profile.curve.rampUpPerSec == 0.04)
-        #expect(profile.curve.rampDownPerSec == 0.02)
-        #expect(profile.curve.rateOfChangeBoost == 0)
-
-        let curve = profile.curve
-        // Fans stay off below 65°C
-        #expect(curve.displayPercent(at: 60) == 0)
-        #expect(curve.displayPercent(at: 65) == 0)
-        #expect(curve.targetPercent(at: 60, fansCurrentlyRunning: false) == nil)
-        #expect(curve.targetPercent(at: 63, fansCurrentlyRunning: true) == 0.001)
-
-        // Suppressed low-mid range via easeIn (pos^2)
-        // At 70°C: pos = (70 - 65) / (96 - 65) = 5 / 31; pos^2 ≈ 0.026
-        #expect(curve.displayPercent(at: 70) < 0.05)
-        // At 80.5°C: pos = 15.5 / 31 = 0.5; pos^2 = 0.25
-        #expect(abs(curve.displayPercent(at: 80.5) - 0.25) < 0.01)
-
-        // Full cooling at ceiling
-        #expect(curve.displayPercent(at: 96) == 1.0)
-        #expect(curve.targetPercent(at: 96, fansCurrentlyRunning: true) == 1.0)
-    }
-
-    @Test("Aggressive profile reaches ceiling early for sustained performance")
-    func aggressiveCurve() {
-        let profile = FanProfile.aggressive
-        #expect(profile.name == "Aggressive")
-        #expect(profile.curve.stopTemp == 45)
-        #expect(profile.curve.startTemp == 50)
-        #expect(profile.curve.ceilingTemp == 86)
-        #expect(profile.curve.maxRPMPercent == 1)
-        #expect(profile.curve.curveShape == .sCurve)
-        #expect(profile.curve.sustainedTriggerSec == 2.5)
-        #expect(profile.curve.rampUpPerSec == 0.18)
-        #expect(profile.curve.rampDownPerSec == 0.04)
-        #expect(profile.curve.rateOfChangeBoost == 0.22)
-
-        let curve = profile.curve
-        // Off below 50°C (does not blast fans at 50°C)
-        #expect(curve.targetPercent(at: 45, fansCurrentlyRunning: false) == nil)
-        #expect(curve.targetPercent(at: 48, fansCurrentlyRunning: false) == nil)
-        #expect(curve.displayPercent(at: 50) == 0)
-
-        // Engages at 50°C
-        #expect(curve.displayPercent(at: 50) == 0)
-
-        // Mid-point at 68°C: pos = 18 / 36 = 0.5; s-curve(0.5) = 0.50
-        #expect(abs(curve.displayPercent(at: 68) - 0.50) < 0.01)
-
-        // High cooling early: at 77°C pos = 27 / 36 = 0.75, s-curve(0.75) ≈ 0.844
-        #expect(curve.displayPercent(at: 77) > 0.80)
-
-        // Full speed at 86°C
-        #expect(curve.displayPercent(at: 86) == 1.0)
-        #expect(curve.targetPercent(at: 86, fansCurrentlyRunning: true) == 1.0)
-    }
-
-    @Test("Curve math handles hysteresis and display preview")
-    func curveMath() {
+    @Test("Curve interpolates linearly and is flat outside its points")
+    func interpolation() {
         let curve = FanProfile.default.curve
-        #expect(curve.targetPercent(at: 45, fansCurrentlyRunning: false) == nil)
-        #expect(curve.targetPercent(at: 54, fansCurrentlyRunning: false) == nil)
-        #expect(curve.targetPercent(at: 49, fansCurrentlyRunning: false) == nil)
-        #expect(curve.targetPercent(at: 52, fansCurrentlyRunning: true) == 0.001)
-        #expect(curve.targetPercent(at: 92, fansCurrentlyRunning: true) == 1)
-        #expect(curve.displayPercent(at: 50) == 0)
-        #expect(curve.displayPercent(at: 55) == 0)
-        #expect(curve.displayPercent(at: 92) == 1)
-        #expect(abs(curve.displayPercent(at: 73.5) - 0.50) < 0.01)
-        #expect(curve.displayPercent(at: 82) > 0.65)
-        #expect(curve.displayPercent(at: 82) < 0.85)
+        #expect(curve.level(at: 40) == 0)
+        #expect(curve.level(at: 70) == 0)
+        #expect(abs(curve.level(at: 79) - 0.275) < 0.001)
+        #expect(curve.level(at: 97) == 1)
+        #expect(curve.level(at: 110) == 1)
+        #expect(FanProfile.system.curve.level(at: 100) == 0)
     }
 
-    @Test("Custom low-temperature threshold adjusts curve and hysteresis")
-    func lowTemperatureRegime() {
-        let base = FanProfile.default
-        let customized = base.withLowTempThreshold(65)
-        #expect(customized.curve.startTemp == 65)
-        #expect(customized.curve.stopTemp == 60)
-        #expect(customized.curve.ceilingTemp == 92)
-
-        // Below start threshold: stays off (hands off to Apple Auto)
-        #expect(customized.curve.targetPercent(at: 62, fansCurrentlyRunning: false) == nil)
-
-        // In hysteresis band: keeps running if already running
-        #expect(customized.curve.targetPercent(at: 62, fansCurrentlyRunning: true) == 0.001)
-
-        // At or below stop threshold: turns off
-        #expect(customized.curve.targetPercent(at: 60, fansCurrentlyRunning: true) == nil)
-        #expect(customized.curve.targetPercent(at: 58, fansCurrentlyRunning: true) == nil)
-
-        // Above start threshold: active curve
-        #expect(customized.curve.targetPercent(at: 66, fansCurrentlyRunning: false) != nil)
-        #expect(customized.curve.targetPercent(at: 92, fansCurrentlyRunning: true) == 1.0)
-
-        // Apple Auto (handsOff) profile is unaffected
-        let systemCustomized = FanProfile.system.withLowTempThreshold(65)
-        #expect(systemCustomized.curve.handsOff == true)
-        #expect(systemCustomized.curve.targetPercent(at: 70, fansCurrentlyRunning: false) == nil)
-
-        // When low-temperature hybrid mode is disabled, app always takes control at minimum RPM or higher
-        let alwaysActive = base.withLowTempThreshold(enabled: false, threshold: 60)
-        #expect(alwaysActive.curve.stopTemp == 0)
-        #expect(alwaysActive.curve.startTemp == 60)
-        #expect(alwaysActive.curve.targetPercent(at: 40, fansCurrentlyRunning: false) == 0.001)
-        #expect(alwaysActive.curve.targetPercent(at: 40, fansCurrentlyRunning: true) == 0.001)
-        #expect((alwaysActive.curve.targetPercent(at: 76, fansCurrentlyRunning: true) ?? 0) > 0.4)
-    }
-
-    @Test("Profile target percentage scales across controllable range above minimum RPM")
-    func profileTargetScalingAcrossControllableRange() {
-        let profile = FanProfile(
-            id: "test",
-            name: "Test",
-            curve: FanProfile.Curve(stopTemp: 55, startTemp: 60, ceilingTemp: 92,
-                                   maxRPMPercent: 1.0, curveShape: .sCurve,
-                                   sustainedTriggerSec: 0)
-        )
-        let status = ThermalStatus(
-            fans: [.init(index: 0, actualRPM: 2317, targetRPM: 2317, minRPM: 2317, maxRPM: 7826, mode: "manual")],
-            temperatures: ["TC0P": 64.8]
-        )
-        let monitor = ThermalMonitor(
-            fanControl: MockLowTempStatusSource(temp: 64.8),
-            profile: profile
-        )
-        // At 60°C (startTemp), steady target is 0.0 (minimum controllable RPM)
-        let targetAt60 = monitor.calculateProfileTargetPercent(status: status, peakTemp: 60.0)
-        #expect(targetAt60 == 0.0)
-
-        // At 64.8°C, target percentage is ~6.1%, actively scaling above minimum
-        let targetAt65 = monitor.calculateProfileTargetPercent(status: status, peakTemp: 64.8)
-        #expect(targetAt65 > 0.05 && targetAt65 < 0.08)
-
-        // At 76°C, midpoint of Default curve is 50%
-        let targetAt76 = monitor.calculateProfileTargetPercent(status: status, peakTemp: 76.0)
-        #expect(abs(targetAt76 - 0.50) < 0.01)
-
-        // At 92°C (ceiling), target is 100%
-        let targetAt92 = monitor.calculateProfileTargetPercent(status: status, peakTemp: 92.0)
-        #expect(targetAt92 == 1.0)
-    }
-
-    @Test("Monitor commands RPM using max-RPM percentage with minimum floor")
-    func monitorCommandsRPMUsingMaxPercentage() throws {
-        let profile = FanProfile(
-            id: "test",
-            name: "Test",
-            curve: FanProfile.Curve(stopTemp: 55, startTemp: 60, ceilingTemp: 92,
-                                   maxRPMPercent: 1.0, curveShape: .sCurve,
-                                   rampUpPerSec: 10.0, sustainedTriggerSec: 0,
-                                   instantEngage: false)
-        )
-        let source = MockLowTempStatusSource(temp: 76)
-        let monitor = ThermalMonitor(
-            fanControl: source,
-            profile: profile,
-            sensorRefreshInterval: 0.05,
-            controlLoopInterval: 0.05
-        )
-        monitor.updateProfiles(
-            battery: profile, adapter: profile,
-            batteryTransform: .identity, adapterTransform: .identity
-        )
-        var appliedCommands: [FanCommand] = []
-        let commandLock = NSLock()
-        let commandReceived = DispatchSemaphore(value: 0)
-        monitor.onFanCommand = { cmd in
-            commandLock.lock()
-            appliedCommands.append(cmd)
-            commandLock.unlock()
-            commandReceived.signal()
+    @Test("Profiles are ordered Quiet ≤ Default ≤ Performance at every temperature")
+    func ordering() {
+        for temp in stride(from: Float(40), through: 105, by: 0.5) {
+            let quiet = FanProfile.quiet.curve.level(at: temp)
+            let standard = FanProfile.default.curve.level(at: temp)
+            let performance = FanProfile.performance.curve.level(at: temp)
+            #expect(quiet <= standard && standard <= performance, "at \(temp)°C")
         }
-
-        monitor.start()
-        defer { monitor.stop() }
-
-        try #require(commandReceived.wait(timeout: .now() + 2) == .success)
-
-        commandLock.lock()
-        let firstCmd = appliedCommands.first
-        commandLock.unlock()
-
-        // At 76°C, the s-curve target is 50% of maximum RPM.
-        // targetRPM = 6000 * 0.50 = 3000 RPM, not 50% of the 2000...6000 span.
-        if case .setRPM(let rpm) = firstCmd {
-            #expect(rpm == 3000)
-        } else {
-            #expect(Bool(false), "Expected .setRPM command, got \(String(describing: firstCmd))")
-        }
+        #expect(FanProfile.quiet.curve.engageTemp > FanProfile.default.curve.engageTemp)
+        #expect(FanProfile.default.curve.engageTemp > FanProfile.performance.curve.engageTemp)
+        #expect(FanProfile.quiet.curve.targetTemp > FanProfile.default.curve.targetTemp)
+        #expect(FanProfile.default.curve.targetTemp > FanProfile.performance.curve.targetTemp)
     }
 
-    @Test("Profile max RPM percentage remains relative to maximum RPM")
-    func profileMaxRPMPercentageUsesMaximumRPM() throws {
-        let profile = FanProfile(
-            id: "limited",
-            name: "Limited",
-            curve: FanProfile.Curve(stopTemp: 55, startTemp: 60, ceilingTemp: 92,
-                                   maxRPMPercent: 0.6, curveShape: .linear,
-                                   sustainedTriggerSec: 0, instantEngage: true)
-        )
-        let monitor = ThermalMonitor(
-            fanControl: MockLowTempStatusSource(temp: 92),
-            profile: profile,
-            sensorRefreshInterval: 0.05,
-            controlLoopInterval: 0.05
-        )
-        monitor.updateProfiles(
-            battery: profile, adapter: profile,
-            batteryTransform: .identity, adapterTransform: .identity
-        )
-        let commandReceived = DispatchSemaphore(value: 0)
-        var firstCommand: FanCommand?
-        let commandLock = NSLock()
-        monitor.onFanCommand = { command in
-            commandLock.lock()
-            if firstCommand == nil { firstCommand = command }
-            commandLock.unlock()
-            commandReceived.signal()
-        }
-
-        monitor.start()
-        defer { monitor.stop() }
-
-        try #require(commandReceived.wait(timeout: .now() + 2) == .success)
-        commandLock.lock()
-        let command = firstCommand
-        commandLock.unlock()
-        if case .setRPM(let rpm) = command {
-            #expect(rpm == 3600)
-        } else {
-            #expect(Bool(false), "Expected .setRPM command, got \(String(describing: command))")
-        }
-    }
-
-    @Test("Curve JSON remains backward compatible")
-    func jsonRoundTrip() throws {
-        let profile = FanProfile.default
-        let data = try JSONEncoder().encode(profile)
-        #expect(try JSONDecoder().decode(FanProfile.self, from: data) == profile)
-
-        let legacy = """
-        {"stopTemp":50,"startTemp":55,"ceilingTemp":70,"maxRPMPercent":0.6,"handsOff":false,"alwaysOn":false,"curveShape":"linear","rampUpPerSec":0.05,"rampDownPerSec":0.025,"sustainedTriggerSec":8,"instantEngage":false}
-        """.data(using: .utf8)!
-        let decoded = try JSONDecoder().decode(FanProfile.Curve.self, from: legacy)
-        #expect(decoded.rateOfChangeBoost == 0)
-    }
-
-    @Test("Safety constants remain conservative")
-    func safety() {
-        #expect(FanProfile.safetyTempThreshold == 105)
-        #expect(FanProfile.hysteresisDegrees == 5)
-        #expect(FanProfile.batteryCoolingTarget(for: 37) == 0)
-        #expect(FanProfile.batteryCoolingTarget(for: 38) == 0)
-        #expect(FanProfile.batteryCoolingTarget(for: 39) == 0.5)
-        #expect(FanProfile.batteryCoolingTarget(for: 40) == 1)
+    @Test("Default stays out of light work and runs 30–40% around 80°C")
+    func defaultShape() {
+        let curve = FanProfile.default.curve
+        // Light work stays with Apple Auto (fan off).
+        #expect(curve.engageTemp >= 70)
+        #expect((0.30...0.40).contains(curve.level(at: 80)))
+        #expect((0.45...0.60).contains(curve.level(at: 85)))
+        // Full speed well before the 105–109°C cores Apple Auto allows under load.
+        #expect(curve.fullSpeedTemp <= 97)
     }
 
     @Test("Power-source transform applies multiplier and shift")
@@ -304,6 +75,8 @@ struct ProfileTests {
         #expect(abs(transform.apply(to: 0.5) - 0.60) < 0.001)
         #expect(transform.apply(to: 0.99) == 1)
         #expect(FanPercentTransform.identity.apply(to: 0.42) == 0.42)
+        // Minimum stays minimum: the shift never applies to a zero demand.
+        #expect(transform.apply(to: 0) == 0)
     }
 
     @Test("An empty thermal snapshot is not treated as a safe low temperature")
@@ -400,71 +173,4 @@ struct ProfileTests {
         #expect(json.contains("\"nominal_peak\" : 65") || json.contains("\"nominal_peak\":65"))
     }
 
-    @Test("ThermalMonitor initializes in idle mode below customized takeover threshold and updateProfiles sets idle")
-    func monitorLowTemperatureRegime() throws {
-        let customized = FanProfile.default.withLowTempThreshold(65)
-        let source = MockLowTempStatusSource(temp: 62.0)
-        let monitor = ThermalMonitor(
-            fanControl: source,
-            profile: customized,
-            batteryProfile: customized,
-            adapterProfile: customized,
-            sensorRefreshInterval: 0.05,
-            controlLoopInterval: 0.05
-        )
-        let updates = DispatchSemaphore(value: 0)
-        let stateLock = NSLock()
-        var lastState: MonitorState?
-        monitor.onUpdate = { _, _, state in
-            stateLock.lock()
-            lastState = state
-            stateLock.unlock()
-            updates.signal()
-        }
-        monitor.start()
-        defer { monitor.stop() }
-
-        try #require(updates.wait(timeout: .now() + 2) == .success)
-        stateLock.lock()
-        let observedState1 = lastState
-        stateLock.unlock()
-        // 62°C is below the 65°C takeover threshold: state must be .idle
-        #expect(observedState1 == .idle)
-        #expect(monitor.state == .idle)
-
-        // updateProfiles should preserve/set idle state
-        let updatedProfile = FanProfile.default.withLowTempThreshold(70)
-        monitor.updateProfiles(battery: updatedProfile, adapter: updatedProfile,
-                               batteryTransform: .identity, adapterTransform: .identity)
-        try #require(updates.wait(timeout: .now() + 2) == .success)
-        stateLock.lock()
-        let observedState2 = lastState
-        stateLock.unlock()
-        #expect(observedState2 == .idle)
-        #expect(monitor.state == .idle)
-    }
-}
-
-private final class MockLowTempStatusSource: ThermalStatusSource, @unchecked Sendable {
-    private let lock = NSLock()
-    private var temp: Float
-
-    init(temp: Float) {
-        self.temp = temp
-    }
-
-    func setTemp(_ t: Float) {
-        lock.lock()
-        temp = t
-        lock.unlock()
-    }
-
-    func status() throws -> ThermalStatus {
-        lock.lock()
-        defer { lock.unlock() }
-        return ThermalStatus(
-            fans: [.init(index: 0, actualRPM: 0, targetRPM: 0, minRPM: 2000, maxRPM: 6000, mode: "auto")],
-            temperatures: ["TC0P": temp, "TG0P": 40.0]
-        )
-    }
 }

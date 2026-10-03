@@ -347,87 +347,84 @@ struct Discover: ParsableCommand {
 struct Watch: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "watch",
-        abstract: "Monitor temps and auto-adjust fans based on a profile"
+        abstract: "Run a fan profile from the terminal (root, without the menu bar app)"
     )
 
-    @Option(name: .shortAndLong, help: "Profile id (default: default)")
+    @Option(name: .shortAndLong, help: "Profile id: \(FanProfile.available.map(\.id).joined(separator: ", "))")
     var profile: String = "default"
 
-    @Option(name: .shortAndLong, help: "Poll interval in seconds (default 0.1 = 100ms)")
+    @Option(name: .shortAndLong, help: "Control loop interval in seconds (default 0.1)")
     var interval: Double = 0.1
 
     @Flag(name: .long, help: "Output JSON on each update")
     var json: Bool = false
 
+    @Flag(name: .long, help: "Show what the profile would do without changing the fans (no root needed)")
+    var dryRun: Bool = false
+
     func run() throws {
-        warnIfDaemonVersionMismatch()
-        let profiles = FanProfile.builtIn
-        guard let selectedProfile = profiles.first(where: { $0.id == profile }) else {
+        if !dryRun { warnIfDaemonVersionMismatch() }
+        guard let selectedProfile = FanProfile.available.first(where: { $0.id == profile }) else {
             throw ValidationError(
-                "Unknown profile '\(profile)'. Options: \(profiles.map(\.id).joined(separator: ", "))"
+                "Unknown profile '\(profile)'. Options: \(FanProfile.available.map(\.id).joined(separator: ", "))"
             )
+        }
+        guard dryRun || geteuid() == 0 else {
+            throw ValidationError("watch writes fan speeds directly and needs root: sudo thermalforge watch (or --dry-run)")
         }
 
         let fc = try FanControl()
-        let monitor = ThermalMonitor(fanControl: fc, profile: selectedProfile)
+        // The CLI runs as root, so targets go straight to the SMC.
+        let actuator = FanActuator { [dryRun] target in
+            if dryRun { return }
+            switch target {
+            case .system: try fc.resetAuto()
+            case .rpm(let rpm): try fc.setAllFans(rpm: Float(rpm))
+            case .perFan(let rpms):
+                for (index, rpm) in rpms.enumerated() { try fc.setSpeed(fan: index, rpm: Float(rpm)) }
+            }
+        }
+        let monitor = ThermalMonitor(source: fc, actuator: actuator,
+                                     batteryProfile: selectedProfile, adapterProfile: selectedProfile,
+                                     controlLoopInterval: interval)
 
         print("ThermalForge watch — profile: \(selectedProfile.name)")
         print("Hardware: \(fc.hardwareInfo)")
-        print("Polling every \(interval)s. Ctrl-C to stop.\n")
+        print("Control loop every \(interval)s. Ctrl-C to stop.\n")
 
-        // CLI runs as root, so fan commands go directly through FanControl
-        monitor.onFanCommand = { command in
-            switch command {
-            case .setMax: try fc.setMax()
-            case .safetyMax: try fc.setMax()
-            case .setRPM(let rpm): try fc.setAllFans(rpm: rpm)
-            case .setFan(let index, let rpm): try fc.setSpeed(fan: index, rpm: rpm)
-            case .resetAuto: try fc.resetAuto()
-            case .setSafetyLimit: break
-            }
-        }
-
-        monitor.onUpdate = { [json] status, activeProfile, state in
+        monitor.onSnapshot = { [json] snapshot in
             if json {
                 let encoder = JSONEncoder()
                 encoder.outputFormatting = [.sortedKeys]
                 encoder.keyEncodingStrategy = .convertToSnakeCase
-                if let data = try? encoder.encode(status),
-                   let line = String(data: data, encoding: .utf8)
-                {
+                if let data = try? encoder.encode(snapshot.status),
+                   let line = String(data: data, encoding: .utf8) {
                     print(line)
                 }
-            } else {
-                let cpuTemp = status.cpuCoreMaxTemp ?? status.temperatures
-                    .filter { k, _ in ["TC", "Tp", "Te", "Tf"].contains(where: { k.hasPrefix($0) }) }
-                    .values.max() ?? 0
-                let gpuTemp = status.gpuCoreMaxTemp ?? status.temperatures
-                    .filter { k, _ in k.hasPrefix("TG") || k.hasPrefix("Tg") }
-                    .values.max() ?? 0
-                let fan0 = status.fans.first.map { $0.actualRPM } ?? 0
-                let stateLabel: String
-                switch state {
-                case .idle: stateLabel = "idle"
-                case .active(let name): stateLabel = name
-                case .safetyOverride: stateLabel = "SAFETY"
-                }
-                let timestamp = ISO8601DateFormatter().string(from: Date())
-                print("[\(timestamp)] CPU: \(String(format: "%.0f", cpuTemp))°C  Hotspot: \(String(format: "%.0f", status.siliconHotspotTemp))°C  GPU: \(String(format: "%.0f", gpuTemp))°C  Fan: \(fan0) RPM  [\(stateLabel)]")
+                return
             }
+            let status = snapshot.status
+            let fan0 = status.fans.first.map { $0.actualRPM } ?? 0
+            let state = snapshot.output.map { "\($0.driver.rawValue) \(Int(($0.level * 100).rounded()))%" } ?? "-"
+            let target = snapshot.target.map { "→ \($0)" } ?? ""
+            print("[\(ISO8601DateFormatter().string(from: Date()))] core \(String(format: "%.1f", status.nominalPeakTemp))°C"
+                  + " (smoothed \(String(format: "%.1f", snapshot.controlTemp))°C)"
+                  + "  hotspot \(String(format: "%.1f", status.siliconHotspotTemp))°C"
+                  + "  fan \(fan0) RPM  [\(state)] \(target)  pressure \(snapshot.pressure)")
         }
 
-        // Set up signal handler for clean shutdown
-        signal(SIGINT) { _ in
+        // Hand fans back to macOS on Ctrl-C.
+        if dryRun {
+            print("Dry run: fan speeds are not changed.\n")
+        } else { signal(SIGINT) { _ in
             print("\nResetting fans to auto...")
             if let resetFC = try? FanControl() {
                 try? resetFC.resetAuto()
             }
             Darwin.exit(0)
-        }
+        } }
 
-        monitor.start(interval: interval)
-
-        // Keep the process alive
+        monitor.start()
         RunLoop.main.run()
     }
 }

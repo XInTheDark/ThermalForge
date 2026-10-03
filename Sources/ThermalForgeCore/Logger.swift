@@ -20,6 +20,15 @@ public final class TFLogger {
     /// How many days of logs to keep. Default 7.
     public var retentionDays: Int = 7
 
+    /// Test runs must not write into the user's real log.
+    private let isEnabled: Bool = {
+        let info = ProcessInfo.processInfo
+        let name = info.processName.lowercased()
+        return !(name.contains("xctest") || name.contains("swiftpm-testing")
+            || info.environment["XCTestConfigurationFilePath"] != nil
+            || Bundle.allBundles.contains { $0.bundlePath.hasSuffix(".xctest") })
+    }()
+
     /// Current day's log file (computed from today's date)
     private var currentLogFile: URL {
         let dateStr = dateFormatter.string(from: Date())
@@ -72,6 +81,7 @@ public final class TFLogger {
     // MARK: - Writing
 
     private func write(_ category: String, _ message: String) {
+        guard isEnabled else { return }
         lock.lock()
         defer { lock.unlock() }
 

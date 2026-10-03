@@ -20,17 +20,16 @@ Tools like **Macs Fan Control** and **TG Pro** charge $15–$20 for fan control 
 | Feature | ThermalForge | Macs Fan Control | TG Pro |
 |---|---|---|---|
 | Adaptive fan curve | **Yes** | No | No |
-| Machine-specific calibration | **Yes (optional)** | No | No |
-| Multi-sensor safety | **Yes — all sensors** | [One sensor per fan](https://github.com/crystalidea/macs-fan-control/issues/266) | Manual rules only |
+| Thermal calibration measurement (CLI) | **Yes** | No | No |
+| Multi-sensor safety | **Yes — all CPU/GPU silicon sensors** | [One sensor per fan](https://github.com/crystalidea/macs-fan-control/issues/266) | Manual rules only |
 | Proactive cooling (ramps before throttle) | **Yes** | No | No |
-| Fan curve type | Per-profile shapes (ease-in, linear, S-curve, instant) | Linear between 2 points | Manual step-function |
+| Fan curve type | Per-profile point curves + sustained-load trim | Linear between 2 points | Manual step-function |
 | Real-time temp monitoring | Yes | Yes | Yes |
 | Menu bar app | Yes | Yes | Yes |
 | CLI access | **Yes** | No | No |
 | Thermal data logging (CSV) | **Yes** | No | Yes |
-| Process correlation in logs | **Yes** | No | No |
 | Sleep/wake re-apply | Yes | Yes | Yes |
-| Safety override (95°C) | **Yes — daemon-enforced, works with app closed** | No | Requires manual setup |
+| Hotspot safety override | **Yes — daemon-enforced, works with app closed** | No | Requires manual setup |
 | Crash recovery (heartbeat watchdog) | **Yes — daemon-enforced, holds during overheat** | Reverts on quit only | Override removes macOS safety |
 | Open source | **Yes** | No | No |
 | Price | **Free** | $15 | $20 |
@@ -45,36 +44,56 @@ Tools like **Macs Fan Control** and **TG Pro** charge $15–$20 for fan control 
 
 ## Features
 
-- Real-time CPU, GPU, RAM, SSD, and ambient temperatures in the menu bar
-- A data-driven Default fan curve with a compact visual preview; future profiles are added through one registry
-- Thermal logging — CSV + JSON data export with process correlation for research
+- Real-time CPU, GPU, hotspot, battery, RAM, SSD, and ambient temperatures in the menu bar
+- Three profiles (Quiet, Default, Performance), each a simple temperature → fan-level curve with a live preview showing where the machine is on it
+- Control that also responds to sustained load, rising temperature, battery temperature, and macOS thermal pressure — the menu shows which one is driving the fans
+- Separate profiles on battery and on the power adapter, with an optional adapter boost
+- Apple Auto when cool: below each profile's takeover point macOS keeps control, so the fans can stop completely
+- Self-healing control: failed fan commands are retried, the daemon re-acquires the fans if macOS takes them back, and nothing latches ThermalForge out of your chosen mode
+- Hotspot safety override (full speed, clears itself once cool), also enforced by the background daemon when the app is closed
+- Crash recovery: the daemon's heartbeat watchdog returns the fans to Apple Auto if the app stops
+- Thermal logging — CSV + JSON data export for research
 - Automatic fan re-apply after sleep/wake
-- Fahrenheit / Celsius toggle
-- Safety override: the background daemon forces fans to maximum if a critical sensor crosses 95°C while a manual hold is keeping them too low — enforced in the daemon, so it works even with the menu bar app closed
-- Crash recovery: the daemon's heartbeat watchdog resets fans to Apple defaults if the app dies — and if a thermal safety override is active, it holds fans at max and defers the reset until the machine cools, so it never hands hot fans back to auto
-- Temperature anomaly detection: logs instant spikes (>5°C in 2s) and sustained changes (>10°C in 30s) with process capture
-- Privileged daemon — one-time sudo, zero password prompts after
-- Native Swift — lightweight, no Electron, no bloat
+- Privileged daemon — one-time admin prompt, no password prompts after
+- Native Swift — lightweight, no Electron
 
 ## Profiles
 
-ThermalForge ships three starting profiles. They are heuristic starting points rather than claims about every Mac's ideal calibration. Default is proactive and smooth, Aggressive starts cooling earlier, and Silent starts later with an ease-in curve that keeps low and mid fan speeds gentler.
+A fan **level** is a position in the fan's own range: 0% is the hardware minimum RPM, 100% the maximum. The menu, the manual slider, and the curves all use this scale. Curves are evaluated against the smoothed hottest CPU/GPU core diode (the Stats-style core temperature, not the junction hotspot).
 
-| Profile | Fans off | Fans start | Ceiling | Max fan | Curve | Sustained trigger | Behavior |
-|---|---:|---:|---:|---:|---|---:|---|
-| **Default** | 50°C | 55°C | 92°C | 100% | S-curve | 5 seconds | Proactive ramp with a modest rising-temperature boost. |
-| **Silent** | 60°C | 65°C | 96°C | 100% | Ease-in | 10 seconds | Gentler low/mid response for acoustic comfort. |
-| **Aggressive** | 45°C | 50°C | 86°C | 100% | S-curve | 2.5 seconds | Earlier, faster response for sustained performance. |
+| Profile | Takeover → Apple Auto again | Curve (core °C → fan level) | Sustained target | Notes |
+|---|---|---|---:|---|
+| **Quiet** | 78°C for 15 s → ≤68°C for 45 s | 78→0%, 84→25%, 90→50%, 95→75%, 99→100% | 90°C | Stays out longest; still far cooler than Apple Auto under load. |
+| **Default** | 70°C for 10 s → ≤62°C for 30 s | 70→0%, 76→15%, 82→40%, 88→65%, 93→85%, 97→100% | 84°C | About 32% at 80°C (40% with the adapter boost). |
+| **Performance** | 62°C for 5 s → ≤55°C for 30 s | 62→0%, 68→15%, 75→45%, 82→75%, 88→100% | 78°C | Loudest; keeps sustained work coolest. |
 
-The menu bar app draws the same curve math used by the controller. It labels the approximate start and 100% temperatures; live output can differ because of hysteresis, the sustained trigger, ramp limits, fan minimum RPM, and optional machine calibration.
+These were tuned on an M4 MacBook Pro against measured Apple Auto behavior: it keeps the fan off for light work, and under a sustained full load it let the core reach 105–109°C and the TCMz hotspot about 115°C while slowly raising the fan from ~2,800 to ~5,000 RPM over 90 seconds. The profiles stay out of light work the same way, then respond much earlier so sustained loads run far cooler. They are starting points, not proven optimums for every Mac.
 
-The fan control loop runs at 100ms by default. The full SMC sensor snapshot runs every 1 second by default and only reads keys found during startup. Both intervals can be changed in the app under **REFRESH**. The expensive full snapshot is reused between samples to keep idle CPU and power low.
+Run only one fan controller at a time. If TG Pro or Macs Fan Control is running, the menu warns you: both apps write fan targets and will fight.
 
-The main curve follows the highest CPU/GPU safety sensor. The app also reads the `TB*` battery temperature sensor: fan demand starts increasing at 38°C and reaches full demand at 40°C. This is a conservative operating target, not a published battery damage threshold. Apple documents recommended ambient ranges for Mac notebooks but does not publish one universal battery-pack degradation temperature. SSD, memory, ambient, and power-delivery sensors are shown and logged for context; they do not currently drive the fan target.
+On top of the curve, every profile applies:
 
-Battery and power-adapter modes have separate profile selections. On the adapter, **Default** applies a small extra cooling transform of `target × 1.10 + 5 percentage points`, clamped to 100%; the app includes a toggle to disable that boost. On battery, the selected curve is used directly. The rationale is to spend available wall power on thermal headroom while keeping battery operation quieter and more efficient.
+- **Smoothing** — a fast-rising (4 s) and slow-falling (20 s) average of the core temperature, so a one-second spike doesn't spin the fans up and a brief pause between bursts doesn't spin them down.
+- **Sustained-load trim** — while the smoothed temperature stays above the profile's target, fan level slowly increases (up to +40%) until it comes back down; it decays once the machine is cooler. This is what keeps long workloads from creeping up and cycling hot.
+- **Rising-temperature boost** — Default and Performance add a little fan level while temperature climbs quickly.
+- **Battery** — `TB*` battery temperature raises the minimum level from 38°C to full speed at 40°C. This is a conservative policy, not a published damage threshold; Apple publishes ambient operating ranges but no universal battery-pack degradation cutoff.
+- **macOS thermal pressure** — when macOS reports fair, serious, or critical thermal pressure (`ProcessInfo.thermalState`), the level is at least 30%, 80%, or 100%.
+- **Adapter boost** (optional, on by default) — on the power adapter the profile level becomes `level × 1.10 + 5 points`. It never lifts minimum speed.
+- **Ramp limits** — each profile limits how fast the level rises and falls, and takeover starts from the speed Apple Auto was already running, so the fans never jump.
 
-To add another profile, define one `FanProfile` value and append it to `FanProfile.available`. The controller, picker, persistence, and curve preview use that registry; no profile-id branch is required.
+SSD, memory, ambient, and power-delivery sensors are shown and logged but do not drive the fans.
+
+In **Settings** you can keep control at minimum speed instead of handing back to Apple Auto, or set one custom takeover temperature for every profile.
+
+The control loop runs every 100 ms; a full SMC sensor snapshot is taken every second from keys found at startup. Both are adjustable under **Refresh**.
+
+To add a profile, define a `FanProfile` and append it to `FanProfile.available`. The controller, pickers, and preview all use that registry.
+
+### Safety
+
+If the hottest CPU/GPU silicon sensor (including junction hotspots such as `TCMz`) stays at or above the safety limit (default 105°C, adjustable 90–115°C) for 2 seconds, fans run at full speed. When it has been at least 8°C below the limit for 10 seconds, fans ramp back to your profile or manual level. It never locks you out of your mode, and it alerts you at most once every ten minutes. The background daemon enforces the same limit on its own if the app stops.
+
+Apple Auto mode means exactly that: ThermalForge only monitors.
 
 ## Install
 
@@ -120,25 +139,16 @@ ThermalForge controls fans through a background daemon, and 0.2.0 locks down how
 
 - **Private control socket.** The daemon listens on `/var/run/thermalforge.sock`, mode `0600`, owned by the user who ran `sudo thermalforge install`. Only that user and root can send fan commands — no other local account can drive your fans.
 - **Structured, versioned protocol.** The CLI, app, and daemon speak a size-capped, versioned message format. Oversized or malformed input is rejected rather than parsed, and a version mismatch surfaces as an "Update needed" prompt instead of silent divergence.
-- **Safety enforced in the daemon.** RPM requests above a fan's maximum are clamped in the daemon, not just the app. Commands are rate-limited. A thermal floor forces fans to maximum if a critical sensor crosses 95°C while a manual hold is keeping them too low — and it runs in the background service, so it works even with the menu bar app closed.
+- **Safety enforced in the daemon.** RPM requests above a fan's maximum are clamped in the daemon, not just the app. Commands are rate-limited. A thermal floor forces fans to maximum if a CPU/GPU silicon sensor reaches the safety limit while a manual hold is keeping them too low — and it runs in the background service, so it works even with the menu bar app closed.
 - **Robust connection handling.** Connections are handled concurrently, bounded, and timed out, so a stuck or slow client can't stall fan control.
-
-## Default profile
-
-The Default profile is this fork's opinionated starting point: keep the familiar smooth system response while trading some acoustics for thermal headroom. It starts around 55°C, reaches full target at 92°C, waits about five seconds of sustained heat before engaging, and adds a small boost when temperature is rising quickly. Calibration data, when present and valid, supplies the machine-specific base target while these safeguards still apply.
-
-The curve is intentionally a heuristic. Apple Silicon models, workloads, ambient temperature, and fan hardware differ, so treat the displayed graph as an estimate and adjust the refresh settings or future profile values after observing your machine.
-
-**Hysteresis:** fans turn on at the start threshold after the sustained trigger and return to Apple auto below the 50°C stop threshold. The gap prevents rapid start/stop cycling.
-
-**Ramp limits:** fan changes are rate-limited to avoid abrupt oscillation. The Default profile uses a faster upward limit than the old profiles and a measured downward limit so cooling remains responsive without chasing every sensor fluctuation.
-
-**0 to minimum RPM is binary:** Apple Silicon fans cannot reliably run below their hardware minimum. When control begins, the command therefore jumps to at least that minimum RPM.
 
 ### FAQ
 
 **What if ThermalForge closes during normal use?**
-The daemon's heartbeat watchdog detects the app is gone within 15 seconds and resets fans to Apple defaults. On next launch, the app syncs to whatever the daemon is currently holding rather than forcing a reset — so a hold you set deliberately (e.g. `sudo thermalforge max`) survives. If a thermal safety override is active when the app dies, the watchdog keeps fans at maximum and defers the reset until the machine has cooled below the safety threshold — it never drops fans back to auto while the machine is hot.
+The daemon's heartbeat watchdog detects the app is gone within 15 seconds and resets fans to Apple defaults. On next launch, the app syncs to whatever the daemon is currently holding rather than forcing a reset — so a hold you set deliberately (e.g. `sudo thermalforge max`) survives. If the daemon's thermal floor is holding fans at maximum when the app dies, the watchdog defers the reset until the machine has cooled — it never drops fans back to auto while the machine is hot.
+
+**What if a fan command fails?**
+ThermalForge keeps your mode and retries (0.5 s, 1 s, 2 s, … then every 10 s), showing a "Retrying fan commands" note if it persists. If the daemon restarts or macOS takes the fans back (for example after wake), ThermalForge notices the fans aren't following and sends the setting again.
 
 ### Resets and troubleshooting
 
@@ -176,7 +186,7 @@ thermalforge max           # Max fans — no sudo when the daemon is running
 thermalforge auto          # Reset to Apple defaults
 thermalforge set 4000      # Set specific RPM — no sudo when the daemon is running
 thermalforge discover      # Dump all SMC keys (for new hardware)
-thermalforge watch         # Monitor mode with auto-boost profiles (requires sudo)
+thermalforge watch         # Run a profile from the terminal (sudo; --dry-run to preview without sudo)
 thermalforge log           # Record thermal data to CSV (1Hz, auto-delete 24h)
 thermalforge log --rate 10 --duration 1h --no-expire   # 10Hz for 1 hour, keep forever
 ```
@@ -185,7 +195,7 @@ thermalforge log --rate 10 --duration 1h --no-expire   # 10Hz for 1 hour, keep f
 
 Fans settle **near** a commanded target rather than exactly on it, so `status` and the menu bar report an RPM slightly above or below what you set — that's the live tach reading, not an error.
 
-Set fans from the terminal and the menu bar app shows a **"Fans held from Terminal"** banner and pauses its automatic control so it won't fight you — press **Default** (or pick a profile) to release the hold.
+Set fans from the terminal and the menu bar app shows a **"Fans held from Terminal"** banner and pauses its automatic control so it won't fight you — choose a mode in the menu (Profile, Apple Auto, or Manual) to take over.
 
 ## Compatibility
 
@@ -273,7 +283,7 @@ Each session produces a self-contained folder:
 
 ThermalForge has three types of stored data, all automatically managed:
 
-**App log** (daily files in `~/Library/Logs/ThermalForge/`) — one file per day (`thermalforge-2026-04-05.log`). Records all app events: profile changes, fan commands, temperature spikes, safety overrides, sustained trigger events. Auto-deletes files older than 7 days on app launch. Each daily file is small and easy to open or share.
+**App log** (daily files in `~/Library/Logs/ThermalForge/`) — one file per day (`thermalforge-2026-04-05.log`). Records app events: mode and profile changes, takeovers and hand-backs, safety overrides, thermal-pressure and power-source changes, and fan command failures. Auto-deletes files older than 7 days on app launch. Each daily file is small and easy to open or share.
 
 **Research session logs** (`thermalforge log` exports in `~/Library/Application Support/ThermalForge/logs/`) — CSV/JSON research data. Auto-delete after 24 hours by default. Use `--no-expire` to keep permanently.
 

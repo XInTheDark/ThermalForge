@@ -109,11 +109,12 @@ struct FanStatusTests {
 
         #expect(status.fans[0].actualPercent == 25)
         #expect(status.fans[1].actualPercent == 10)
-        #expect(status.manualFanCommands(forPercent: 50) == [.setFan(index: 0, rpm: 5000), .setFan(index: 1, rpm: 5000)])
-        #expect(status.manualFanCommands(forPercent: -10) == [.setFan(index: 0, rpm: 2000), .setFan(index: 1, rpm: 2500)])
-        #expect(status.manualFanCommands(forPercent: 110) == [.setFan(index: 0, rpm: 8000), .setFan(index: 1, rpm: 7500)])
-        #expect(status.manualFanCommands(forPercent: .nan) == nil)
-        #expect(status.manualFanCommands(forPercent: .infinity) == nil)
+        #expect(status.perFanTarget(level: 0.5) == .perFan([5000, 5000]))
+        #expect(status.perFanTarget(level: 0.5)?.commands == [.setFan(index: 0, rpm: 5000), .setFan(index: 1, rpm: 5000)])
+        #expect(status.perFanTarget(level: -0.1) == .perFan([2000, 2500]))
+        #expect(status.perFanTarget(level: 1.1) == .perFan([8000, 7500]))
+        #expect(status.perFanTarget(level: .nan) == nil)
+        #expect(status.perFanTarget(level: .infinity) == nil)
     }
 
     @Test("Missing fan limits prevent manual control and show an unknown percentage")
@@ -123,8 +124,9 @@ struct FanStatusTests {
         let valid = ThermalStatus.FanStatus(index: 0, actualRPM: 5000, targetRPM: 5000,
                                            minRPM: 2000, maxRPM: 8000, mode: "auto")
         #expect(unknown.actualPercent == nil)
-        #expect(ThermalStatus(fans: [valid, unknown], temperatures: [:]).manualFanCommands(forPercent: 50) == nil)
-        #expect(ThermalStatus(fans: [], temperatures: [:]).manualFanCommands(forPercent: 50) == nil)
+        #expect(ThermalStatus(fans: [valid, unknown], temperatures: [:]).perFanTarget(level: 0.5) == nil)
+        #expect(ThermalStatus(fans: [valid, unknown], temperatures: [:]).controlRange == nil)
+        #expect(ThermalStatus(fans: [], temperatures: [:]).perFanTarget(level: 0.5) == nil)
     }
 
     @Test("Stopped fans and tachometer overshoot stay within zero to 100 percent")

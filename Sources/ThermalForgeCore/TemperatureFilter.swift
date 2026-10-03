@@ -2,74 +2,56 @@
 //  TemperatureFilter.swift
 //  ThermalForgeCore
 //
-//  Symmetric Exponential Moving Average (EMA) filter with state-dependent time constants.
+//  Asymmetric exponential moving average for the control temperature.
 //
 
 import Darwin
 import Foundation
 
-/// Symmetric Exponential Moving Average (EMA) filter for temperature readings.
+/// Exponential moving average with a shorter time constant for rising
+/// temperatures (attack) than for falling ones (decay).
 ///
-/// Dampens instantaneous single-core thermal diode spikes symmetrically to avoid
-/// the "ratchet" or peak-detector bias of asymmetric filters.
-///
-/// Uses distinct physical time constants based on fan operational state:
-/// - **Ramp-Up / Acceleration ($\approx 10\text{s}$)**: Responsive window during workload start and fan acceleration.
-/// - **Ramp-Down / Deceleration ($\approx 30\text{s}$)**: Extended window while fans are decelerating, matching
-///   chassis thermal mass dissipation and preventing audible fan speed hunting.
+/// Core diodes on Apple Silicon jump by 10–20°C within a second when a burst
+/// starts and fall just as fast when it stops, while the heatsink and chassis
+/// change over tens of seconds. A quick attack lets the fans respond to real
+/// load within a few seconds; a slow decay keeps them from chasing every pause
+/// between bursts, which is what causes audible hunting and repeated hot cycles.
 public struct TemperatureFilter: Sendable, Equatable {
     public var isEnabled: Bool
-    public var rampUpWindowSeconds: Double
-    public var rampDownWindowSeconds: Double
+    /// Time constant while the input is above the filtered value, seconds.
+    public var attackSeconds: Double
+    /// Time constant while the input is below the filtered value, seconds.
+    public var decaySeconds: Double
 
     public private(set) var filteredValue: Float?
-    private var lastSampleUptime: UInt64?
+
+    public static let defaultAttackSeconds: Double = 4
+    public static let defaultDecaySeconds: Double = 20
 
     public init(isEnabled: Bool = true,
-                rampUpWindowSeconds: Double = 10.0,
-                rampDownWindowSeconds: Double = 30.0) {
+                attackSeconds: Double = TemperatureFilter.defaultAttackSeconds,
+                decaySeconds: Double = TemperatureFilter.defaultDecaySeconds) {
         self.isEnabled = isEnabled
-        self.rampUpWindowSeconds = max(1.0, rampUpWindowSeconds)
-        self.rampDownWindowSeconds = max(1.0, rampDownWindowSeconds)
+        self.attackSeconds = max(0.5, attackSeconds)
+        self.decaySeconds = max(0.5, decaySeconds)
     }
 
-    /// Update the filter with a new raw temperature sample using symmetric EMA.
-    /// - Parameters:
-    ///   - rawTemp: Raw instantaneous temperature in °C.
-    ///   - timeConstant: Effective smoothing window ($\tau$) in seconds. If nil, defaults to `rampUpWindowSeconds`.
-    ///   - nowUptime: Monotonic uptime timestamp in nanoseconds.
-    /// - Returns: Smoothed temperature in °C.
+    /// Advance the filter by `dt` seconds toward `rawTemp`.
     @discardableResult
-    public mutating func update(rawTemp: Float,
-                                timeConstant: Double? = nil,
-                                nowUptime: UInt64 = DispatchTime.now().uptimeNanoseconds) -> Float {
-        guard isEnabled else {
+    public mutating func update(rawTemp: Float, dt: Double) -> Float {
+        guard isEnabled, let current = filteredValue, dt > 0 else {
             filteredValue = rawTemp
-            lastSampleUptime = nowUptime
             return rawTemp
         }
-
-        guard let current = filteredValue, let lastTime = lastSampleUptime else {
-            filteredValue = rawTemp
-            lastSampleUptime = nowUptime
-            return rawTemp
-        }
-
-        let dt = max(0.001, Double(nowUptime - lastTime) / 1_000_000_000.0)
-        lastSampleUptime = nowUptime
-
-        // Symmetric EMA: tau is identical for rising and falling within this state.
-        let tau = max(0.5, timeConstant ?? rampUpWindowSeconds)
-        let alpha = Float(1.0 - exp(-dt / tau))
-
+        let tau = rawTemp >= current ? attackSeconds : decaySeconds
+        let alpha = Float(1.0 - exp(-dt / max(0.5, tau)))
         let next = current + alpha * (rawTemp - current)
         filteredValue = next
         return next
     }
 
-    /// Reset internal filter state (e.g. on profile change or sensor reinitialization).
+    /// Forget history (profile change, wake from sleep, sensor recovery).
     public mutating func reset() {
         filteredValue = nil
-        lastSampleUptime = nil
     }
 }

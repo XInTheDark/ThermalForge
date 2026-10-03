@@ -2,7 +2,7 @@
 //  PreferencesView.swift
 //  ThermalForgeApp
 //
-//  Dedicated preferences window view with interactive slider controls.
+//  Settings window.
 //
 
 import SwiftUI
@@ -12,230 +12,102 @@ struct PreferencesView: View {
     @EnvironmentObject var appState: AppState
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-            // Header
-            HStack(spacing: 10) {
-                Image(systemName: "gearshape.fill")
-                    .font(.title2)
-                    .foregroundStyle(.secondary)
-                Text("ThermalForge Settings")
-                    .font(.headline)
-            }
-            .padding(.bottom, 2)
-
-            Divider()
-
-            // Temperature Smoothing
-            VStack(alignment: .leading, spacing: 8) {
-                Text("TEMPERATURE SMOOTHING")
-                    .font(.caption)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(.secondary)
-
-                Toggle("Smooth temperature readings", isOn: $appState.temperatureSmoothingEnabled)
-                    .fontWeight(.medium)
-
-                Text("Symmetric Exponential Moving Average (EMA) dampens instantaneous core spikes without ratchet bias, using distinct time constants for fan ramp-up vs ramp-down.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                if appState.temperatureSmoothingEnabled {
-                    VStack(alignment: .leading, spacing: 6) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack {
-                                Text("Ramp-up smoothing window")
-                                    .font(.subheadline)
-                                Spacer()
-                                Text(String(format: "%.1f s", appState.rampUpWindowSeconds))
-                                    .font(.system(.subheadline, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                            }
-                            Slider(value: $appState.rampUpWindowSeconds, in: 3.0...20.0, step: 1.0)
-                        }
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack {
-                                Text("Ramp-down smoothing window")
-                                    .font(.subheadline)
-                                Spacer()
-                                Text(String(format: "%.1f s", appState.rampDownWindowSeconds))
-                                    .font(.system(.subheadline, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                            }
-                            Slider(value: $appState.rampDownWindowSeconds, in: 10.0...60.0, step: 2.0)
-                        }
-
-                        Text("Responsive \(String(format: "%.0f", appState.rampUpWindowSeconds))s window while accelerating; extended \(String(format: "%.0f", appState.rampDownWindowSeconds))s window while decelerating to match chassis thermal mass and prevent fan speed hunting.")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .padding(.top, 4)
+        Form {
+            Section {
+                Toggle("Hand fans back to Apple Auto when cool", isOn: $appState.handBackWhenCool)
+                Toggle("Custom takeover temperature", isOn: $appState.customTakeoverEnabled)
+                    .disabled(!appState.handBackWhenCool)
+                if appState.customTakeoverEnabled && appState.handBackWhenCool {
+                    LabeledSlider(title: "Take over at", value: $appState.customTakeoverTemp, range: 50...90, step: 1,
+                                  format: temperature)
                 }
+            } header: {
+                Text("Takeover")
+            } footer: {
+                Text(appState.handBackWhenCool
+                     ? "Below the takeover temperature macOS controls the fans, so they can stop completely. Each profile has its own takeover point (\(profileTakeovers)); a custom value replaces it for every profile."
+                     : "ThermalForge always controls the fans and keeps them at least at minimum speed.")
             }
 
-            Divider()
+            Section {
+                Toggle("Adapter cooling boost", isOn: $appState.adapterBoostEnabled)
+            } footer: {
+                Text("On the power adapter, profile fan levels are multiplied by 1.10 and raised by 5 points.")
+            }
 
-            // Refresh Rates
-            VStack(alignment: .leading, spacing: 8) {
-                Text("REFRESH RATES")
-                    .font(.caption)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(.secondary)
+            Section {
+                LabeledSlider(title: "Hotspot limit", value: $appState.safetyLimitTemp,
+                              range: Double(FanProfile.safetyLimitRange.lowerBound)...Double(FanProfile.safetyLimitRange.upperBound),
+                              step: 1, format: temperature)
+            } header: {
+                Text("Safety")
+            } footer: {
+                Text("If the hottest CPU/GPU silicon sensor stays at this limit for 2 seconds, fans run at full speed until it is 8°C cooler for 10 seconds, then return to your mode. The background service enforces the same limit if the app stops. Default: \(Int(FanProfile.safetyTempThreshold))°C.")
+            }
 
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Sensor snapshot interval")
-                            .font(.subheadline)
-                        Spacer()
-                        Text(formatSensorInterval(appState.sensorRefreshInterval))
-                            .font(.system(.subheadline, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
-                    Slider(value: $appState.sensorRefreshInterval, in: 0.5...5.0, step: 0.5)
+            Section {
+                Toggle("Smooth the control temperature", isOn: $appState.smoothingEnabled)
+                if appState.smoothingEnabled {
+                    LabeledSlider(title: "Rising response", value: $appState.smoothingAttackSeconds, range: 1...15, step: 1,
+                                  format: { "\(Int($0)) s" })
+                    LabeledSlider(title: "Falling response", value: $appState.smoothingDecaySeconds, range: 5...60, step: 1,
+                                  format: { "\(Int($0)) s" })
                 }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Control loop interval")
-                            .font(.subheadline)
-                        Spacer()
-                        Text(formatControlInterval(appState.controlLoopInterval))
-                            .font(.system(.subheadline, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
-                    Slider(value: $appState.controlLoopInterval, in: 0.05...0.50, step: 0.025)
-                }
-
-                Text("Defaults: 1.0s sensor snapshot, 100ms fan control loop.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+            } header: {
+                Text("Smoothing")
+            } footer: {
+                Text("Core temperatures jump within a second; the heatsink changes over tens of seconds. A short rising time constant reacts to real load quickly, and a longer falling one keeps fans from chasing every pause. Defaults: \(Int(TemperatureFilter.defaultAttackSeconds)) s and \(Int(TemperatureFilter.defaultDecaySeconds)) s.")
             }
 
-            Divider()
-
-            // Thermal Safety Limit
-            VStack(alignment: .leading, spacing: 8) {
-                Text("THERMAL SAFETY LIMIT")
-                    .font(.caption)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(.secondary)
-
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Upper limit threshold")
-                            .font(.subheadline)
-                        Spacer()
-                        Text(formatSafetyLimit(appState.safetyLimitTemp))
-                            .font(.system(.subheadline, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
-                    Slider(value: $appState.safetyLimitTemp, in: 90.0...115.0, step: 1.0)
-                }
-
-                Text("If any sensor reaches this limit and exceeds the profile output by ≥10%, fans immediately lock at 100% maximum RPM and trigger a desktop alert. Default: 105°C.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            Section {
+                LabeledSlider(title: "Sensor snapshot", value: $appState.sensorRefreshInterval, range: 0.5...5, step: 0.5,
+                              format: { $0 < 1 ? "\(Int($0 * 1000)) ms" : String(format: "%.1f s", $0) })
+                LabeledSlider(title: "Control loop", value: $appState.controlLoopInterval, range: 0.05...0.5, step: 0.05,
+                              format: { "\(Int(($0 * 1000).rounded())) ms" })
+            } header: {
+                Text("Refresh")
+            } footer: {
+                Text("Defaults: 1 s sensor snapshot, 100 ms control loop.")
             }
 
-            Divider()
-
-            // Hybrid Control (Low Temperature Regime)
-            VStack(alignment: .leading, spacing: 8) {
-                Text("HYBRID CONTROL (LOW TEMPERATURE REGIME)")
-                    .font(.caption)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(.secondary)
-
-                Toggle("Enable low-temperature hybrid mode", isOn: $appState.lowTempRegimeEnabled)
-                    .fontWeight(.medium)
-
-                HStack {
-                    Text("Minimum takeover temperature")
-                        .font(.subheadline)
-                    Spacer()
-                    TextField("", value: lowTempBinding, format: .number)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(width: 55)
-                        .multilineTextAlignment(.trailing)
-                    Text(appState.useFahrenheit ? "°F" : "°C")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    Stepper("", value: lowTempBinding, in: appState.useFahrenheit ? 110...185 : 45...85, step: 1)
-                        .labelsHidden()
-                }
-                .disabled(!appState.lowTempRegimeEnabled)
-                .opacity(appState.lowTempRegimeEnabled ? 1.0 : 0.5)
-
-                Text(appState.lowTempRegimeEnabled
-                     ? "Below this threshold, fan control is handed to macOS (Apple Auto) so fans stay silent (0 RPM). ThermalForge only takes control when CPU temperature rises above this threshold. Default: 60°C (140°F)."
-                     : "When disabled, ThermalForge always controls the fans at minimum hardware RPM or higher, actively cooling the heatsink without returning to Apple Auto.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            Section("General") {
+                Toggle("Show temperatures in °F", isOn: $appState.useFahrenheit)
+                Toggle("Launch at login", isOn: $appState.launchAtLogin)
             }
-
-            Divider()
-
-            // General
-            VStack(alignment: .leading, spacing: 8) {
-                Text("GENERAL")
-                    .font(.caption)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(.secondary)
-
-                Toggle("Display Fahrenheit (°F)", isOn: $appState.useFahrenheit)
-                Toggle("Launch at Login", isOn: $appState.launchAtLogin)
-                Toggle("Adapter cooling boost (+5% shift, ×1.10 target on AC)", isOn: $appState.adapterBoostEnabled)
-            }
-
-            Spacer()
-            }
-            .padding(20)
         }
-        .frame(width: 440, height: 720)
+        .formStyle(.grouped)
+        .frame(width: 460, height: 640)
     }
 
-    private var lowTempBinding: Binding<Double> {
-        Binding(
-            get: {
-                if appState.useFahrenheit {
-                    return round(appState.lowTempThreshold * 9 / 5 + 32)
-                } else {
-                    return round(appState.lowTempThreshold)
-                }
-            },
-            set: { newValue in
-                if appState.useFahrenheit {
-                    let celsius = (newValue - 32) * 5 / 9
-                    appState.lowTempThreshold = celsius
-                } else {
-                    appState.lowTempThreshold = newValue
-                }
+    private var profileTakeovers: String {
+        FanProfile.available
+            .map { "\($0.name) \(temperature(Double($0.curve.engageTemp)))" }
+            .joined(separator: ", ")
+    }
+
+    private func temperature(_ celsius: Double) -> String {
+        TemperatureFormat.string(Float(celsius), fahrenheit: appState.useFahrenheit, decimals: 0)
+    }
+}
+
+private struct LabeledSlider: View {
+    let title: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let step: Double
+    let format: (Double) -> String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(title)
+                Spacer()
+                Text(format(value))
+                    .font(.body.monospacedDigit())
+                    .foregroundStyle(.secondary)
             }
-        )
-    }
-
-    private func formatSafetyLimit(_ tempC: Double) -> String {
-        if appState.useFahrenheit {
-            let tempF = Int(round(tempC * 9 / 5 + 32))
-            return "\(tempF) °F"
-        } else {
-            return "\(Int(round(tempC))) °C"
+            Slider(value: $value, in: range, step: step)
+                .labelsHidden()
         }
-    }
-
-    private func formatSensorInterval(_ interval: Double) -> String {
-        if interval < 1.0 {
-            return "\(Int(interval * 1000)) ms"
-        }
-        return interval == floor(interval) ? "\(Int(interval)).0 s" : "\(String(format: "%.1f", interval)) s"
-    }
-
-    private func formatControlInterval(_ interval: Double) -> String {
-        return "\(Int(interval * 1000)) ms"
     }
 }

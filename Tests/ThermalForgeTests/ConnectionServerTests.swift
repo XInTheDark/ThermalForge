@@ -98,6 +98,51 @@ struct ConnectionServerTests {
         #expect(result.appliedRPM == 2317)
     }
 
+    @Test("A fan command retries once after the daemon restarts")
+    func retryAfterDaemonRestart() throws {
+        let path = "/tmp/tf-restart-\(UUID().uuidString).sock"
+        unlink(path)
+        let listening = DispatchSemaphore(value: 0)
+        var server: ConnectionServer?
+        var listenFD: Int32 = -1
+        // The first attempt finds no daemon; it comes back while the client waits.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) {
+            listenFD = bindListener(path)
+            server = ConnectionServer(listenFD: listenFD) { _ in .ok(appliedRPM: 2317) }
+            server?.start()
+            listening.signal()
+        }
+        defer {
+            _ = listening.wait(timeout: .now() + 5)
+            close(listenFD)
+            unlink(path)
+        }
+
+        let result = try DaemonClient(socketPath: path).executeRetryingDisconnect(.setRPM(2317))
+        #expect(result.appliedRPM == 2317)
+        _ = server
+    }
+
+    @Test("A daemon rejection is reported without a retry")
+    func rejectionIsNotRetried() throws {
+        let path = "/tmp/tf-reject-\(UUID().uuidString).sock"
+        let listenFD = bindListener(path)
+        defer { close(listenFD); unlink(path) }
+        let calls = NSLock()
+        var count = 0
+        let server = ConnectionServer(listenFD: listenFD) { _ in
+            calls.lock(); count += 1; calls.unlock()
+            return .failure(.internal, "unlock timed out")
+        }
+        server.start()
+
+        #expect(throws: DaemonError.self) {
+            try DaemonClient(socketPath: path).executeRetryingDisconnect(.setRPM(2317))
+        }
+        calls.lock(); defer { calls.unlock() }
+        #expect(count == 1)
+    }
+
     @Test("8 connect-and-hang sockets don't starve a real request — served within ~1s")
     func floodThenRealRequest() throws {
         let path = "/tmp/tf-conn-test.sock"

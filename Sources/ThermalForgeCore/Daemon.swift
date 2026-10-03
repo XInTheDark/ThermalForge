@@ -81,12 +81,47 @@ public enum ThermalForgeDaemon {
     }
 }
 
+/// Detects an installed daemon binary that differs from the app's bundled CLI.
+/// Local builds keep the same marketing version, so the `version` verb alone can't
+/// tell a stale daemon from a current one. The comparison is cached by file size and
+/// modification date so a periodic caller does not reread megabytes every tick.
+/// Not thread-safe: call it from one serial queue.
+public final class DaemonBinaryCheck {
+    private let bundledPath: String
+    private let installedPath: String
+    private var cachedKey: String?
+    private var cachedDiffers: Bool?
+
+    public init(bundledPath: String, installedPath: String = ThermalForgeDaemon.installPath) {
+        self.bundledPath = bundledPath
+        self.installedPath = installedPath
+    }
+
+    /// True when the binaries differ, false when identical, nil when either is unreadable.
+    public func installedDiffers() -> Bool? {
+        let fm = FileManager.default
+        guard fm.isReadableFile(atPath: bundledPath), fm.isReadableFile(atPath: installedPath),
+              let bundled = try? fm.attributesOfItem(atPath: bundledPath),
+              let installed = try? fm.attributesOfItem(atPath: installedPath) else { return nil }
+        let key = [bundled, installed]
+            .map { "\($0[.size] ?? "")|\($0[.modificationDate] ?? "")" }
+            .joined(separator: "|")
+        if key != cachedKey {
+            cachedKey = key
+            cachedDiffers = !fm.contentsEqual(atPath: bundledPath, andPath: installedPath)
+        }
+        return cachedDiffers
+    }
+}
+
 // MARK: - Daemon Client
 
 public enum DaemonError: Error, CustomStringConvertible {
     case notRunning
     case connectionFailed
     case commandFailed(String)
+    /// The daemon understood the request and refused it.
+    case rejected(DaemonErrorKind, String)
     /// The running daemon speaks the pre-Phase-2 string protocol (upgrade window:
     /// `brew upgrade` done, `sudo thermalforge install` not yet). Its socket is up so
     /// it isn't "not running" — callers must handle this distinctly (reinstall nudge /
@@ -99,7 +134,7 @@ public enum DaemonError: Error, CustomStringConvertible {
             return "ThermalForge daemon is not running. Run: sudo thermalforge install"
         case .connectionFailed:
             return "Failed to connect to daemon socket"
-        case .commandFailed(let msg):
+        case .commandFailed(let msg), .rejected(_, let msg):
             return "Daemon error: \(msg)"
         case .incompatibleDaemon:
             return "The background daemon is an older build using the previous control protocol. Reinstall to reconnect: sudo thermalforge install"
@@ -176,7 +211,7 @@ public final class DaemonClient {
         return state
     }
 
-    /// Apply a `FanCommand`, throwing `commandFailed` on an error response.
+    /// Apply a `FanCommand`, throwing `rejected` on an error response.
     /// - oneshot: apply the command but do NOT arm the heartbeat watchdog — for
     ///   fire-and-forget CLI holds that must persist without a supervising process.
     ///   The menu bar app leaves this false so it stays supervised/crash-protected.
@@ -186,12 +221,51 @@ public final class DaemonClient {
         let timeout = command.isHold ? DaemonProtocol.fanCommandTimeout : 2.0
         let response = try request(DaemonRequest(command, oneshot: oneshot), timeout: timeout)
         guard response.ok else {
-            throw DaemonError.commandFailed(
-                response.message ?? response.error.map { String(describing: $0) } ?? "daemon error"
-            )
+            let message = response.message ?? response.error.map { String(describing: $0) } ?? "daemon error"
+            throw DaemonError.rejected(response.error ?? .internal, message)
         }
         // Note + applied RPM ride back on an OK response (e.g. a clamp).
         return FanApplyResult(note: response.note, appliedRPM: response.appliedRPM)
+    }
+
+    /// Apply a command, retrying once when the daemon dropped the connection early
+    /// (it crashed or launchd is restarting it). A restarted daemon resets fans to
+    /// Apple Auto before it listens, and every fan command is idempotent, so one
+    /// resend is safe. Daemon rejections and full-length timeouts are not retried.
+    @discardableResult
+    public func executeRetryingDisconnect(_ command: FanCommand,
+                                          reconnectWindow: TimeInterval = 5.0) throws -> FanApplyResult {
+        let started = Date()
+        do {
+            return try execute(command)
+        } catch where Self.isDisconnect(error) {
+            let timeout = command.isHold ? DaemonProtocol.fanCommandTimeout : 2.0
+            guard Date().timeIntervalSince(started) < timeout / 2 else { throw error }
+            let deadline = Date().addingTimeInterval(reconnectWindow)
+            while !isReachable(), Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            TFLogger.shared.info("Daemon connection dropped (\(error)) — retrying \(command) once")
+            return try execute(command)
+        }
+    }
+
+    private static func isDisconnect(_ error: Error) -> Bool {
+        if let error = error as? DaemonError, case .notRunning = error { return true }
+        if let error = error as? DaemonProtocol.FrameError {
+            return error == .closed || error == .write
+        }
+        return false
+    }
+
+    private func isReachable() -> Bool {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        setPath(&addr, socketPath)
+        return connectWithTimeout(fd, &addr, timeout: 0.5)
     }
 
     /// Send one typed request and return the typed response — length-prefixed JSON
@@ -717,6 +791,7 @@ public final class DaemonServer {
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0) { [self] in
             smcLock.lock()
             defer { smcLock.unlock() }
+            fanControl.forgetAcquisition()
             do {
                 try applyCommandString(command)
                 NSLog("ThermalForge daemon: re-applied after wake")
@@ -729,8 +804,8 @@ public final class DaemonServer {
     // MARK: - Request Processing
 
     /// Decode a request body → response: the framing/version/log wrapper around the
-    /// atomic process(). smcLock is taken ONLY for the process() call — never around
-    /// the I/O, so a slow-reading client can no longer hold it during the write.
+    /// atomic process(). smcLock is taken ONLY for an SMC verb's process() call — never
+    /// around the I/O, so a slow-reading client can no longer hold it during the write.
     private func processFrame(_ body: Data) -> DaemonResponse {
         guard let request = try? DaemonProtocol.decode(DaemonRequest.self, from: body) else {
             // Undecodable = unknown verb or a shape from a newer client.
@@ -740,9 +815,16 @@ public final class DaemonServer {
         guard request.v <= DaemonProtocol.version else {
             return .unsupported(daemonVersion: ThermalForgeVersion.current)
         }
-        smcLock.lock()
-        let response = process(request)
-        smcLock.unlock()
+        // Non-SMC verbs skip smcLock: a slow unlock must not stall heartbeats past
+        // the client's timeout, abandoning their sockets and flagging the daemon down.
+        let response: DaemonResponse
+        if request.verb.usesSMC {
+            smcLock.lock()
+            response = process(request)
+            smcLock.unlock()
+        } else {
+            response = process(request)
+        }
         // Verb + outcome only — never raw client bytes.
         NSLog("ThermalForge daemon: verb=%@ outcome=%@", request.verb.rawValue,
               response.ok ? "ok" : (response.error?.rawValue ?? "error"))
@@ -750,7 +832,7 @@ public final class DaemonServer {
     }
 
     /// The full request dispatch — MOVED VERBATIM from the pre-Phase-4 serial handler.
-    /// The CALLER holds smcLock for the whole call, so every check-then-act
+    /// For SMC verbs the CALLER holds smcLock for the whole call, so every check-then-act
     /// (blockedByCLIHold, rate limit, clamp, recordHold + SMC write) stays atomic exactly
     /// as before; Phase 4 concurrency lives only in the I/O around this, never inside it.
     /// Same-class concurrent writers resolve by last-write-wins (recordHold overwrites) —

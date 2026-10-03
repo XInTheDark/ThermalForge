@@ -13,488 +13,556 @@ struct MenuBarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Header
-            HStack(spacing: 8) {
-                Text("ThermalForge")
-                    .font(.headline)
-                Button(action: { PreferencesWindowController.shared.show(appState: appState) }) {
-                    Image(systemName: "gearshape")
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Settings")
-                Spacer()
-                stateIndicator
-            }
-            .padding(.horizontal, 12)
-            .padding(.top, 10)
-            .padding(.bottom, 6)
-
+            header
             Divider()
-
-            if let sensorFault = appState.sensorFaultMessage {
-                SensorFaultBanner(reason: sensorFault)
-                Divider()
-            }
-
-            if appState.daemonInstalled == false {
-                DaemonInstallBanner(onInstall: { appState.installDaemon() })
-                Divider()
-            } else if appState.daemonUnreachable {
-                // Daemon not answering — nothing in the app can touch the fans, so
-                // this takes over the top of the menu and offers a one-click fix.
-                // The version/hold banners are moot while it's unreachable.
-                DaemonDownBanner(onRestart: { appState.restartDaemon() })
-                Divider()
+            banners
+            if let snapshot = appState.snapshot {
+                StatusSection(snapshot: snapshot)
+                Divider().padding(.vertical, 6)
+                TemperatureSection(status: snapshot.status)
             } else {
-                // Update-needed banner — shown whenever the daemon is out of sync.
-                // Persistent (no dismiss): a stale daemon should keep nagging.
-                if let daemonVersion = appState.daemonVersionMismatch {
-                    DaemonUpdateBanner(daemonVersion: daemonVersion)
-                    Divider()
-                }
-
-                // CLI-hold banner — the app is reflecting a hold set from the
-                // terminal and won't adjust fans until the user takes over. The
-                // Default button (or picking a profile) releases it.
-                if let hold = appState.externalHold {
-                    ExternalHoldBanner(hold: hold)
-                    Divider()
-                }
-
-                // Update-available banner — informational, lowest priority. Suppressed
-                // while "Update needed" (daemon out of sync) shows, so two update-ish
-                // banners never stack; can coexist with a CLI hold.
-                if appState.daemonVersionMismatch == nil, let update = appState.availableUpdate {
-                    UpdateAvailableBanner(update: update, onDismiss: { appState.dismissUpdate() })
-                    Divider()
-                }
-            }
-
-            // Fan speeds
-            if let status = appState.latestStatus {
-                SectionHeader(title: "FANS")
-                ForEach(status.fans, id: \.index) { fan in
-                    HStack {
-                        Text("Fan \(fan.index)")
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Text(fanSpeedLabel(fan))
-                            .font(.system(.body, design: .monospaced))
-                            .help("Actual RPM within this fan's minimum-to-maximum range.")
-                        Text("\(fan.actualRPM) RPM")
-                            .font(.system(.body, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 1)
-                }
-
-                ManualFanControlView()
-                    .padding(.horizontal, 12)
-
-                Divider().padding(.vertical, 4)
-
-                // Temperatures
-                SectionHeader(title: "TEMPERATURES")
-                TemperatureRow(label: "CPU", value: appState.temperatureSmoothingEnabled ? (appState.smoothedPeakTemp ?? appState.latestStatus?.cpuCoreMaxTemp ?? peakTemp(prefixes: ["TC", "Tp", "Te", "Tf"])) : (appState.latestStatus?.cpuCoreMaxTemp ?? peakTemp(prefixes: ["TC", "Tp", "Te", "Tf"])), fahrenheit: appState.useFahrenheit)
-                    .help(cpuHelpText)
-                TemperatureRow(label: "GPU", value: appState.latestStatus?.gpuCoreMaxTemp ?? peakTemp(prefixes: ["TG", "Tg"]), fahrenheit: appState.useFahrenheit)
-                TemperatureRow(label: "RAM", value: peakTemp(prefixes: ["TR", "Tm", "TM"]), fahrenheit: appState.useFahrenheit)
-                TemperatureRow(label: "SSD", value: peakTemp(prefixes: ["TH"]), fahrenheit: appState.useFahrenheit)
-                TemperatureRow(label: "Ambient", value: peakTemp(prefixes: ["TA", "Ta"]), fahrenheit: appState.useFahrenheit)
-            } else {
-                Text("Reading sensors...")
+                Text("Reading sensors…")
                     .foregroundStyle(.secondary)
                     .padding(12)
             }
-
-            Divider().padding(.vertical, 4)
-
-            // Power-source profile pickers
-            SectionHeader(title: "PROFILES")
-            Picker("Battery", selection: Binding(
-                get: { appState.batteryProfileID },
-                set: { id in
-                    if let profile = FanProfile.available.first(where: { $0.id == id }) {
-                        appState.selectBatteryProfile(profile)
-                    }
-                }
-            )) {
-                ForEach(FanProfile.available) { profile in
-                    Text(profile.name).tag(profile.id)
-                }
-            }
-            .pickerStyle(.menu)
-            .padding(.horizontal, 12)
-            Picker("Power adapter", selection: Binding(
-                get: { appState.adapterProfileID },
-                set: { id in
-                    if let profile = FanProfile.available.first(where: { $0.id == id }) {
-                        appState.selectAdapterProfile(profile)
-                    }
-                }
-            )) {
-                ForEach(FanProfile.available) { profile in
-                    Text(profile.name).tag(profile.id)
-                }
-            }
-            .pickerStyle(.menu)
-            .padding(.horizontal, 12)
-            Text(appState.usingExternalPower
-                 ? (appState.adapterBoostEnabled ? "Adapter: +5% shift, ×1.10 fan target" : "Adapter: base fan target")
-                 : "Battery: base fan target")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 12)
-
-            FanCurvePreview(profile: appState.currentPreviewProfile,
-                            transform: appState.usingExternalPower && appState.adapterBoostEnabled ? .adapterDefault : .identity,
-                            fahrenheit: appState.useFahrenheit)
-                .padding(.horizontal, 12)
-
-            Divider().padding(.vertical, 4)
-
-            // Quick actions
-            HStack(spacing: 8) {
-                Button(action: { appState.setDefault() }) {
-                    Label("Default", systemImage: "fan.fill")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .disabled(appState.resettingFans)
-                Button(action: { appState.resetAuto() }) {
-                    Label("Apple Auto", systemImage: "arrow.counterclockwise")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .disabled(appState.resettingFans)
-            }
-            .padding(.horizontal, 12)
-            Toggle("Adapter cooling boost", isOn: $appState.adapterBoostEnabled)
-                .padding(.horizontal, 12)
-
-            Divider().padding(.vertical, 4)
-
-            // Footer
-            HStack {
-                Button(action: { PreferencesWindowController.shared.show(appState: appState) }) {
-                    Label("Settings...", systemImage: "gearshape")
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-
-                Spacer()
-
-                Button(action: { NSApp.terminate(nil) }) {
-                    Text("Quit")
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 12)
-            .padding(.top, 4)
-            .padding(.bottom, 8)
+            Divider().padding(.vertical, 6)
+            ControlSection()
+            Divider().padding(.vertical, 6)
+            footer
         }
-        .frame(width: 260)
+        .frame(width: 300)
     }
 
-    // MARK: - Helpers
+    private var header: some View {
+        HStack(spacing: 8) {
+            Text("ThermalForge")
+                .font(.headline)
+            Spacer()
+            ModeBadge()
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 10)
+        .padding(.bottom, 8)
+    }
 
     @ViewBuilder
-    private var stateIndicator: some View {
-        if appState.manualAppliedPercent != nil {
-            Label("Manual", systemImage: "hand.raised.fill")
-                .font(.caption)
-                .foregroundStyle(.orange)
-        } else {
-            switch appState.monitorState {
-            case .safetyOverride:
-                Label("SAFETY", systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            case .active(let name):
-                Label(name, systemImage: "fan.fill")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-            case .idle:
-                Label("Idle", systemImage: "fan")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+    private var banners: some View {
+        if appState.daemonInstalled == false {
+            Banner(style: .warning, title: "Fan control needs setup", systemImage: "lock.shield",
+                   message: "Install the background service once to control fans without repeated password prompts.",
+                   actionTitle: "Install Service", action: { appState.installDaemon() })
+        } else if appState.daemonUnreachable {
+            Banner(style: .error, title: "Fan control unavailable", systemImage: "exclamationmark.octagon.fill",
+                   message: "The background service isn't responding. macOS keeps controlling the fans until it's back.",
+                   actionTitle: "Restart Service", action: { appState.restartDaemon() })
+        } else if let daemonVersion = appState.daemonVersionMismatch {
+            Banner(style: .warning, title: "Update the background service", systemImage: "arrow.triangle.2.circlepath",
+                   message: "It's running \(daemonVersion); the app is \(ThermalForgeVersion.current). Fan control may not behave as described until they match.",
+                   actionTitle: AppState.bundledCLIPath == nil ? nil : "Update Service",
+                   action: { appState.installDaemon() },
+                   command: AppState.bundledCLIPath == nil ? "sudo thermalforge install" : nil)
+        }
+
+        if let other = appState.competingFanApp, !appState.appleAutoSelected {
+            Banner(style: .warning, title: "\(other) is also controlling the fans", systemImage: "exclamationmark.2",
+                   message: "Two fan controllers overwrite each other's speeds. Quit \(other) or switch ThermalForge to Apple Auto.")
+        }
+        if let hold = appState.externalHold {
+            Banner(style: .warning, title: "Fans held from Terminal", systemImage: "terminal.fill",
+                   message: Self.describe(hold) + " Choose a mode below to take over.")
+        }
+        if let issue = appState.snapshot?.sensorIssue {
+            Banner(style: .warning, title: "Sensors unavailable", systemImage: "thermometer.medium.slash",
+                   message: "macOS has the fans because \(issue). Control resumes automatically when readings return.")
+        }
+        if appState.loopStalled {
+            Banner(style: .warning, title: "Control loop paused", systemImage: "pause.circle",
+                   message: "macOS has the fans until the control loop catches up.")
+        }
+        if case .retrying(let failures, _) = appState.commandHealth, !appState.daemonUnreachable,
+           appState.daemonInstalled != false {
+            Banner(style: .warning, title: "Retrying fan commands", systemImage: "arrow.clockwise",
+                   message: "The last \(failures) fan commands didn't go through. ThermalForge keeps retrying and stays in your chosen mode.")
+        }
+        if appState.snapshot?.safetyOverride == true, let snapshot = appState.snapshot {
+            Banner(style: .error, title: "Full speed: hotspot \(formatTemp(snapshot.status.safetyPeakTemp))",
+                   systemImage: "flame.fill",
+                   message: "A silicon hotspot reached the \(formatTemp(Float(appState.safetyLimitTemp))) safety limit. Fans return to your profile once it cools.")
+        }
+        if appState.daemonVersionMismatch == nil, let update = appState.availableUpdate {
+            UpdateAvailableBanner(update: update, onDismiss: { appState.dismissUpdate() })
+        }
+    }
+
+    private var footer: some View {
+        HStack {
+            Button {
+                PreferencesWindowController.shared.show(appState: appState)
+            } label: {
+                Label("Settings…", systemImage: "gearshape")
             }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            Spacer()
+            Button("Quit") { NSApp.terminate(nil) }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
         }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 10)
     }
 
-    private var cpuHelpText: String {
-        if let hotspot = appState.latestStatus?.siliconHotspotTemp {
-            return "CPU Core Peak · Hotspot: \(String(format: "%.1f", hotspot))°C"
-        }
-        return "Hottest CPU core diode"
+    private func formatTemp(_ celsius: Float) -> String {
+        TemperatureFormat.string(celsius, fahrenheit: appState.useFahrenheit, decimals: 0)
     }
 
-    private func peakTemp(prefixes: [String]) -> Float? {
-        guard let temps = appState.latestStatus?.temperatures else { return nil }
-        let values = temps.filter { key, _ in prefixes.contains(where: { key.hasPrefix($0) }) }.values
-        return values.max()
-    }
-
-    private func fanSpeedLabel(_ fan: ThermalStatus.FanStatus) -> String {
-        if fan.actualRPM == 0 {
-            return "Off"
+    static func describe(_ hold: DaemonHoldState) -> String {
+        let parts = (hold.command ?? "").split(separator: " ").map(String.init)
+        switch parts.first {
+        case "max": return "Fans are held at maximum."
+        case "set" where parts.count > 1: return "Fans are held at about \(parts[1]) RPM."
+        case "setfan" where parts.count > 2: return "Fan \(parts[1]) is held at about \(parts[2]) RPM."
+        default: return "Fans are held manually."
         }
-        guard let percent = fan.actualPercent else { return "—" }
-        if percent == 0 {
-            return "Min"
-        }
-        return "\(percent)%"
     }
 }
 
-private struct ManualFanControlView: View {
-    @EnvironmentObject private var appState: AppState
+// MARK: - Mode badge
+
+private struct ModeBadge: View {
+    @EnvironmentObject var appState: AppState
+
+    var body: some View {
+        Label(text, systemImage: icon)
+            .font(.caption.weight(.medium))
+            .foregroundStyle(color)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(color.opacity(0.14)))
+    }
+
+    private var text: String {
+        if appState.externalHold != nil { return "Terminal" }
+        if appState.snapshot?.safetyOverride == true { return "Safety" }
+        if let manual = appState.manualPercent { return "Manual \(Int(manual))%" }
+        if appState.appleAutoSelected { return "Apple Auto" }
+        return appState.currentProfile.name
+    }
+
+    private var icon: String {
+        if appState.snapshot?.safetyOverride == true { return "exclamationmark.triangle.fill" }
+        if appState.manualPercent != nil { return "hand.raised.fill" }
+        if appState.appleAutoSelected || appState.externalHold != nil { return "apple.logo" }
+        return "fan.fill"
+    }
+
+    private var color: Color {
+        if appState.snapshot?.safetyOverride == true { return .red }
+        if appState.manualPercent != nil || appState.externalHold != nil { return .orange }
+        if appState.appleAutoSelected { return .secondary }
+        return .accentColor
+    }
+}
+
+// MARK: - Status
+
+private struct StatusSection: View {
+    @EnvironmentObject var appState: AppState
+    let snapshot: MonitorSnapshot
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("Manual fan test")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            HStack(alignment: .firstTextBaseline) {
+                Text(TemperatureFormat.string(appState.menuTemperature ?? snapshot.status.nominalPeakTemp,
+                                              fahrenheit: appState.useFahrenheit, decimals: 0))
+                    .font(.system(size: 28, weight: .semibold, design: .rounded))
+                    .foregroundStyle(TemperatureFormat.color(snapshot.status.nominalPeakTemp))
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("CPU/GPU core")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if appState.smoothingEnabled {
+                        Text("smoothed")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
                 Spacer()
-                if let applied = appState.manualAppliedPercent {
-                    Text("Active · \(Int(applied))%")
-                        .font(.caption2.bold())
-                        .foregroundStyle(.orange)
+                VStack(alignment: .trailing, spacing: 0) {
+                    ForEach(snapshot.status.fans, id: \.index) { fan in
+                        Text(fanLabel(fan))
+                            .font(.system(.callout, design: .monospaced))
+                    }
                 }
             }
 
-            HStack(spacing: 8) {
-                Slider(value: Binding(
-                    get: { appState.manualFanPercent },
-                    set: { appState.manualFanPercent = $0.rounded() }
-                ), in: 0...100)
-                    .accessibilityLabel("Manual fan target")
-                    .accessibilityValue("\(Int(appState.manualFanPercent)) percent")
-                Text("\(Int(appState.manualFanPercent.rounded()))%")
-                    .font(.system(.caption, design: .monospaced))
-                    .frame(width: 34, alignment: .trailing)
-                Button(appState.manualApplyInProgress ? "Applying…" : "Apply") {
-                    appState.applyManualFanPercent(appState.manualFanPercent)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .disabled(!appState.canApplyManualControl)
-            }
-
-            Text("0% is minimum speed. Apple Auto releases control.")
-                .font(.caption2)
+            Label(driverText, systemImage: driverIcon)
+                .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-
-            if let error = appState.manualControlError {
-                Text(error)
-                    .font(.caption2)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
         }
-        .padding(.top, 2)
+        .padding(.horizontal, 12)
+        .padding(.top, 8)
+    }
+
+    private func fanLabel(_ fan: ThermalStatus.FanStatus) -> String {
+        let prefix = snapshot.status.fans.count > 1 ? "Fan \(fan.index + 1) " : ""
+        guard fan.actualRPM > 0 else { return prefix + "Off" }
+        let percent = fan.actualPercent.map { $0 == 0 ? "min" : "\($0)%" } ?? "—"
+        return "\(prefix)\(fan.actualRPM) RPM · \(percent)"
+    }
+
+    private var driverText: String {
+        let temp = { (c: Float) in TemperatureFormat.string(c, fahrenheit: appState.useFahrenheit, decimals: 0) }
+        if appState.externalHold != nil { return "Following the Terminal hold." }
+        if snapshot.sensorIssue != nil { return "Apple Auto until sensors recover." }
+        switch snapshot.mode {
+        case .paused:
+            return "Waiting for the background service."
+        case .manual:
+            return snapshot.target.map { "Holding \($0) until you choose a profile." } ?? "Holding a manual speed."
+        case .automatic:
+            break
+        }
+        if snapshot.profile.curve.handsOff { return "macOS controls the fans." }
+        guard let output = snapshot.output else { return "Starting…" }
+        let (engageAt, _) = appState.controlSettings.thresholds(for: snapshot.profile.curve)
+        switch output.driver {
+        case .appleAuto:
+            return appState.handBackWhenCool
+                ? "Apple Auto while cool. \(snapshot.profile.name) takes over above \(temp(engageAt))."
+                : "Starting…"
+        case .standby: return "Minimum speed — below the curve."
+        case .curve: return "Following the \(snapshot.profile.name) curve."
+        case .rising: return "Temperature rising — responding early."
+        case .sustained: return "Sustained load — +\(Int((output.sustainedTrim * 100).rounded()))% to hold \(temp(snapshot.profile.curve.targetTemp))."
+        case .battery: return "Battery at \(temp(snapshot.status.batteryTemp ?? 0)) — cooling the battery."
+        case .pressure: return "macOS reports \(snapshot.pressure.description.lowercased()) thermal pressure."
+        case .safety: return "Hotspot safety override — full speed."
+        }
+    }
+
+    private var driverIcon: String {
+        guard let output = snapshot.output else { return "info.circle" }
+        switch output.driver {
+        case .appleAuto: return "apple.logo"
+        case .standby, .curve: return "chart.xyaxis.line"
+        case .rising: return "arrow.up.right"
+        case .sustained: return "clock.arrow.circlepath"
+        case .battery: return "battery.75percent"
+        case .pressure: return "gauge.with.dots.needle.67percent"
+        case .safety: return "flame.fill"
+        }
     }
 }
 
+private struct TemperatureSection: View {
+    @EnvironmentObject var appState: AppState
+    let status: ThermalStatus
+
+    var body: some View {
+        let rows: [(String, Float?, String?)] = [
+            ("CPU", status.cpuCoreMaxTemp, nil),
+            ("GPU", status.gpuCoreMaxTemp, nil),
+            ("Hotspot", status.siliconHotspotTemp, "Hottest silicon junction. Drives the safety override, not the curve."),
+            ("Battery", status.batteryTemp, nil),
+            ("SSD", peak(["TH"]), nil),
+            ("Memory", peak(["TR", "Tm", "TM"]), nil),
+            ("Ambient", peak(["TA", "Ta"]), nil),
+        ]
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 2) {
+            ForEach(rows.filter { $0.1 != nil }, id: \.0) { row in
+                GridRow {
+                    Text(row.0)
+                        .foregroundStyle(.secondary)
+                        .help(row.2 ?? "")
+                    Spacer()
+                    Text(TemperatureFormat.string(row.1!, fahrenheit: appState.useFahrenheit, decimals: 1))
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundStyle(TemperatureFormat.color(row.1!))
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+    }
+
+    private func peak(_ prefixes: [String]) -> Float? {
+        status.temperatures.filter { key, _ in prefixes.contains { key.hasPrefix($0) } }.values.max()
+    }
+}
+
+// MARK: - Control
+
+private struct ControlSection: View {
+    @EnvironmentObject var appState: AppState
+
+    enum Mode: Hashable { case profile, appleAuto, manual }
+
+    private var mode: Mode {
+        if appState.manualPercent != nil { return .manual }
+        if appState.appleAutoSelected { return .appleAuto }
+        return .profile
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Picker("Mode", selection: Binding(get: { mode }, set: select)) {
+                Text("Profile").tag(Mode.profile)
+                Text("Apple Auto").tag(Mode.appleAuto)
+                Text("Manual").tag(Mode.manual)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            switch mode {
+            case .profile: ProfileControls()
+            case .appleAuto:
+                Text("macOS controls the fans. ThermalForge only monitors.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .manual: ManualControls()
+            }
+        }
+        .padding(.horizontal, 12)
+    }
+
+    private func select(_ newMode: Mode) {
+        switch newMode {
+        case .profile: appState.resumeProfiles()
+        case .appleAuto: appState.selectAppleAuto()
+        case .manual:
+            // Start from the current speed so switching causes no jump.
+            let current = appState.snapshot?.status.fans.compactMap(\.actualPercent).max() ?? 50
+            appState.manualDraftPercent = Double(current)
+            appState.applyManual(Double(current))
+        }
+    }
+}
+
+private struct ProfileControls: View {
+    @EnvironmentObject var appState: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 4) {
+                GridRow {
+                    Label("Battery", systemImage: "battery.75percent")
+                        .foregroundStyle(appState.usingExternalPower ? .secondary : .primary)
+                    profilePicker(selection: appState.batteryProfileID, select: appState.selectBatteryProfile)
+                }
+                GridRow {
+                    Label("Adapter", systemImage: "powerplug")
+                        .foregroundStyle(appState.usingExternalPower ? .primary : .secondary)
+                    profilePicker(selection: appState.adapterProfileID, select: appState.selectAdapterProfile)
+                }
+            }
+            .font(.callout)
+
+            Text(appState.currentProfile.summary)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            FanCurvePreview(profile: appState.currentProfile,
+                            settings: appState.controlSettings,
+                            externalPower: appState.usingExternalPower,
+                            liveTemp: appState.snapshot?.controlTemp,
+                            liveLevel: appState.snapshot?.output.flatMap { $0.engaged ? $0.level : nil },
+                            fahrenheit: appState.useFahrenheit)
+        }
+    }
+
+    private func profilePicker(selection: String, select: @escaping (FanProfile) -> Void) -> some View {
+        Picker("", selection: Binding(
+            get: { selection },
+            set: { id in select(FanProfile.selectable(id: id)) }
+        )) {
+            ForEach(FanProfile.available) { profile in
+                Text(profile.name).tag(profile.id)
+            }
+        }
+        .pickerStyle(.menu)
+        .labelsHidden()
+    }
+}
+
+private struct ManualControls: View {
+    @EnvironmentObject var appState: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Slider(value: $appState.manualDraftPercent, in: 0...100, step: 1) { editing in
+                    if !editing { appState.applyManual(appState.manualDraftPercent) }
+                }
+                .accessibilityLabel("Manual fan level")
+                .accessibilityValue("\(Int(appState.manualDraftPercent)) percent")
+                Text("\(Int(appState.manualDraftPercent))%")
+                    .font(.system(.callout, design: .monospaced))
+                    .frame(width: 40, alignment: .trailing)
+            }
+            .disabled(!appState.canApplyManual)
+            Text("0% is the fans' minimum speed. The hotspot safety override still applies.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+// MARK: - Curve preview
+
 private struct FanCurvePreview: View {
     let profile: FanProfile
-    let transform: FanPercentTransform
+    let settings: ControlSettings
+    let externalPower: Bool
+    let liveTemp: Float?
+    let liveLevel: Float?
     let fahrenheit: Bool
 
     var body: some View {
         let curve = profile.curve
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Approximate fan curve")
-                .font(.caption.weight(.semibold))
+        let (engageAt, _) = settings.thresholds(for: curve)
+        let transform = externalPower ? settings.adapterTransform : settings.batteryTransform
+        let lowTemp = min(engageAt, curve.points.first?.temp ?? engageAt) - 8
+        let highTemp = max(curve.fullSpeedTemp, curve.points.last?.temp ?? engageAt) + 4
+
+        VStack(alignment: .leading, spacing: 3) {
             Canvas { context, size in
-                let plot = CGRect(x: 28, y: 8, width: max(size.width - 36, 1), height: max(size.height - 28, 1))
-                var path = Path()
-                let minTemp = curve.stopTemp
-                let maxTemp = max(curve.ceilingTemp, curve.startTemp + 1)
-                for index in 0...40 {
-                    let fraction = Float(index) / 40
-                    let temp = minTemp + (maxTemp - minTemp) * fraction
-                    let percent = transform.apply(to: curve.displayPercent(at: temp))
-                    let point = CGPoint(x: plot.minX + CGFloat(fraction) * plot.width,
-                                        y: plot.maxY - CGFloat(percent) * plot.height)
-                    if index == 0 { path.move(to: point) } else { path.addLine(to: point) }
+                let plot = CGRect(x: 0, y: 4, width: size.width, height: size.height - 8)
+                func point(_ temp: Float, _ level: Float) -> CGPoint {
+                    let x = CGFloat((temp - lowTemp) / (highTemp - lowTemp))
+                    return CGPoint(x: plot.minX + x * plot.width, y: plot.maxY - CGFloat(level) * plot.height)
                 }
-                context.stroke(path, with: .color(.orange), lineWidth: 2)
-                var axes = Path()
-                axes.move(to: CGPoint(x: plot.minX, y: plot.minY)); axes.addLine(to: CGPoint(x: plot.minX, y: plot.maxY))
-                axes.move(to: CGPoint(x: plot.minX, y: plot.maxY)); axes.addLine(to: CGPoint(x: plot.maxX, y: plot.maxY))
-                context.stroke(axes, with: .color(.secondary.opacity(0.5)), lineWidth: 1)
+
+                // Grid lines at 25% steps.
+                for step in 1...3 {
+                    var line = Path()
+                    let y = plot.maxY - CGFloat(step) / 4 * plot.height
+                    line.move(to: CGPoint(x: plot.minX, y: y))
+                    line.addLine(to: CGPoint(x: plot.maxX, y: y))
+                    context.stroke(line, with: .color(.secondary.opacity(0.15)), lineWidth: 0.5)
+                }
+
+                // Apple Auto region below the takeover temperature.
+                if settings.handBackWhenCool {
+                    let x = point(engageAt, 0).x
+                    context.fill(Path(CGRect(x: plot.minX, y: plot.minY, width: max(x - plot.minX, 0), height: plot.height)),
+                                 with: .color(.secondary.opacity(0.08)))
+                }
+
+                var path = Path()
+                let steps = 60
+                for index in 0...steps {
+                    let temp = lowTemp + (highTemp - lowTemp) * Float(index) / Float(steps)
+                    let engaged = !settings.handBackWhenCool || temp >= engageAt
+                    let level = engaged ? transform.apply(to: curve.level(at: temp)) : 0
+                    let p = point(temp, level)
+                    if index == 0 { path.move(to: p) } else { path.addLine(to: p) }
+                }
+                context.stroke(path, with: .color(.accentColor), lineWidth: 2)
+
+                var base = Path()
+                base.move(to: CGPoint(x: plot.minX, y: plot.maxY))
+                base.addLine(to: CGPoint(x: plot.maxX, y: plot.maxY))
+                context.stroke(base, with: .color(.secondary.opacity(0.4)), lineWidth: 1)
+
+                if let liveTemp {
+                    let clamped = min(max(liveTemp, lowTemp), highTemp)
+                    var marker = Path()
+                    let x = point(clamped, 0).x
+                    marker.move(to: CGPoint(x: x, y: plot.minY))
+                    marker.addLine(to: CGPoint(x: x, y: plot.maxY))
+                    context.stroke(marker, with: .color(.orange.opacity(0.6)), style: StrokeStyle(lineWidth: 1, dash: [3, 2]))
+                    if let liveLevel {
+                        let dot = point(clamped, liveLevel)
+                        context.fill(Path(ellipseIn: CGRect(x: dot.x - 3.5, y: dot.y - 3.5, width: 7, height: 7)),
+                                     with: .color(.orange))
+                    }
+                }
             }
-            .frame(height: 92)
+            .frame(height: 70)
+
             HStack {
-                Text("0%")
+                Text(TemperatureFormat.string(lowTemp, fahrenheit: fahrenheit, decimals: 0))
                 Spacer()
-                Text("Starts ~\(displayTemp(curve.startTemp))")
+                Text("takeover \(TemperatureFormat.string(engageAt, fahrenheit: fahrenheit, decimals: 0))")
                 Spacer()
-                Text("100% ~\(displayTemp(curve.ceilingTemp))")
+                Text(TemperatureFormat.string(highTemp, fahrenheit: fahrenheit, decimals: 0))
             }
-            .font(.caption2)
+            .font(.caption2.monospacedDigit())
             .foregroundStyle(.secondary)
-            Text("Steady-temperature estimate; ramp delay and hysteresis can change the live result.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-        }
-    }
 
-    private func displayTemp(_ celsius: Float) -> String {
-        let value = fahrenheit ? celsius * 9 / 5 + 32 : celsius
-        let unit = fahrenheit ? "F" : "C"
-        return "\(Int(value.rounded()))°\(unit)"
+            Text("Steady-temperature estimate (min → max RPM). Live speed also follows smoothing, ramp limits, sustained load, rising temperature, battery, and macOS thermal pressure.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 }
 
-// MARK: - Subviews
+// MARK: - Shared pieces
 
-private struct SensorFaultBanner: View {
-    let reason: String
-
-    private var isLockedAtMax: Bool {
-        reason.contains("locked at maximum")
+enum TemperatureFormat {
+    static func string(_ celsius: Float, fahrenheit: Bool, decimals: Int) -> String {
+        let value = fahrenheit ? celsius * 9 / 5 + 32 : celsius
+        return String(format: "%.\(decimals)f°%@", value, fahrenheit ? "F" : "C")
     }
+
+    /// Color thresholds, always in °C.
+    static func color(_ celsius: Float) -> Color {
+        if celsius >= 95 { return .red }
+        if celsius >= 85 { return .orange }
+        if celsius >= 70 { return .yellow }
+        return .primary
+    }
+}
+
+private struct Banner: View {
+    enum Style { case warning, error }
+
+    let style: Style
+    let title: String
+    let systemImage: String
+    let message: String
+    var actionTitle: String? = nil
+    var action: (() -> Void)? = nil
+    var command: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Label(isLockedAtMax ? "Fans locked at maximum" : "Thermal monitoring stopped", systemImage: "exclamationmark.triangle.fill")
+            Label(title, systemImage: systemImage)
                 .font(.caption.bold())
-                .foregroundStyle(.red)
-            if isLockedAtMax {
-                Text("\(reason) Press Default below (or select a profile) to reset.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
-                Text("ThermalForge handed fan control back to macOS because \(reason). It will stay in Apple Auto until you choose a profile again.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                .foregroundStyle(tint)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let command {
+                Text(command)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(RoundedRectangle(cornerRadius: 4).fill(Color.secondary.opacity(0.15)))
+            }
+            if let actionTitle, let action {
+                Button(actionTitle, action: action)
+                    .buttonStyle(.borderedProminent)
+                    .tint(style == .error ? .red : .orange)
+                    .controlSize(.small)
+                    .padding(.top, 2)
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.red.opacity(0.12))
+        .background(tint.opacity(0.12))
     }
+
+    private var tint: Color { style == .error ? .red : .orange }
 }
 
-/// Banner shown when a hold was set from the CLI. Explains what's pinned and how
-/// to release it without needing to know any terminal commands.
-private struct ExternalHoldBanner: View {
-    let hold: DaemonHoldState
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Label("Fans held from Terminal", systemImage: "terminal.fill")
-                .font(.caption.bold())
-                .foregroundStyle(.orange)
-
-            Text(describe(hold.command))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            Text("Press Default below (or pick a profile) to release.")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.orange.opacity(0.12))
-    }
-
-    private func describe(_ command: String?) -> String {
-        let parts = (command ?? "").split(separator: " ").map(String.init)
-        switch parts.first {
-        // Approximate language on purpose: the held value is the fan's TARGET, but the
-        // RPM shown in the fan rows is the actual tach, which hovers ~1% around it. Exact
-        // wording ("pinned to 3500") next to a row reading 3488/3512 looks like a bug.
-        case "max":
-            return "Fans are held at maximum. The app won't adjust them until you take over."
-        case "set" where parts.count > 1:
-            return "Fans are held at about \(parts[1]) RPM. The app won't adjust them until you take over."
-        case "setfan" where parts.count > 2:
-            return "Fan \(parts[1]) is held at about \(parts[2]) RPM. The app won't adjust fans until you take over."
-        default:
-            return "Fans are held manually. The app won't adjust them until you take over."
-        }
-    }
-}
-
-/// Non-modal in-menu banner telling the user the background daemon is out of
-/// sync and exactly how to fix it. Command is selectable so it can be copied.
-private struct DaemonUpdateBanner: View {
-    let daemonVersion: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Label("Update needed", systemImage: "exclamationmark.triangle.fill")
-                .font(.caption.bold())
-                .foregroundStyle(.orange)
-
-            Text("The background service is running \(daemonVersion), but the app is \(ThermalForgeVersion.current). Fan control may not match what you set until they're re-synced.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            Text("Run this in Terminal:")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .padding(.top, 2)
-                .fixedSize(horizontal: false, vertical: true)
-
-            Text("sudo thermalforge install")
-                .font(.system(.caption, design: .monospaced))
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(RoundedRectangle(cornerRadius: 4).fill(Color.secondary.opacity(0.15)))
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.orange.opacity(0.12))
-    }
-}
-
-private struct DaemonInstallBanner: View {
-    let onInstall: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Label("Fan control needs setup", systemImage: "lock.shield")
-                .font(.caption.bold())
-                .foregroundStyle(.orange)
-            Text("Install the background service once to control fans without repeated password prompts.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Button("Install Service", action: onInstall)
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.orange.opacity(0.12))
-    }
-}
-
-/// Shown when a newer ThermalForge release exists than the installed build. Purely
-/// informational (blue, not the orange "Update needed"): it tells the user an update
-/// shipped and how to get it — the app can't run `brew upgrade` for them. Dismissible
-/// per-version via "Later".
+/// A newer ThermalForge release exists. Informational and dismissible per version.
 private struct UpdateAvailableBanner: View {
     let update: AvailableUpdate
     let onDismiss: () -> Void
@@ -504,18 +572,10 @@ private struct UpdateAvailableBanner: View {
             Label("Update available", systemImage: "arrow.down.circle.fill")
                 .font(.caption.bold())
                 .foregroundStyle(.blue)
-
             Text("ThermalForge \(update.version) is available. You have \(ThermalForgeVersion.current).")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-
-            Text("Update with:")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .padding(.top, 2)
-                .fixedSize(horizontal: false, vertical: true)
-
             Text("brew upgrade thermalforge && sudo thermalforge install")
                 .font(.system(.caption, design: .monospaced))
                 .textSelection(.enabled)
@@ -523,12 +583,6 @@ private struct UpdateAvailableBanner: View {
                 .padding(.horizontal, 6)
                 .padding(.vertical, 3)
                 .background(RoundedRectangle(cornerRadius: 4).fill(Color.secondary.opacity(0.15)))
-
-            Text("Built from source? Run  git pull && ./setup.sh")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
-
             HStack {
                 if let url = URL(string: update.url) {
                     Link("What's new", destination: url)
@@ -546,89 +600,5 @@ private struct UpdateAvailableBanner: View {
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.blue.opacity(0.12))
-    }
-}
-
-/// Shown when the daemon has stopped answering — fan control is impossible until
-/// it's back. Offers a one-click restart (launchd kickstart via a macOS admin
-/// prompt). The daemon's KeepAlive usually restarts it on its own, so this is the
-/// manual nudge for the rare stuck case; it never asks the user to reinstall.
-private struct DaemonDownBanner: View {
-    let onRestart: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Label("Fan control unavailable", systemImage: "exclamationmark.octagon.fill")
-                .font(.caption.bold())
-                .foregroundStyle(.red)
-
-            Text("The background service isn't responding, so profiles and Default can't change the fans right now.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            Button(action: onRestart) {
-                Label("Restart daemon", systemImage: "arrow.clockwise")
-                    .font(.caption.bold())
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.red)
-            .padding(.top, 2)
-
-            Text("Asks for your password once. If it doesn't come back right away, it will keep retrying on its own.")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.red.opacity(0.12))
-    }
-}
-
-private struct SectionHeader: View {
-    let title: String
-    var body: some View {
-        Text(title)
-            .font(.caption2)
-            .foregroundStyle(.tertiary)
-            .padding(.horizontal, 12)
-            .padding(.bottom, 2)
-    }
-}
-
-private struct TemperatureRow: View {
-    let label: String
-    let value: Float?
-    var fahrenheit: Bool = false
-
-    var body: some View {
-        HStack {
-            Text(label)
-                .foregroundStyle(.secondary)
-            Spacer()
-            if let tempC = value {
-                let display = fahrenheit ? tempC * 9 / 5 + 32 : tempC
-                let unit = fahrenheit ? "F" : "C"
-                Text("\(String(format: "%.1f", display))°\(unit)")
-                    .font(.system(.body, design: .monospaced))
-                    .foregroundStyle(tempColor(tempC))
-            } else {
-                Text("—")
-                    .foregroundStyle(.tertiary)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 1)
-    }
-
-    /// Color thresholds always based on °C
-    private func tempColor(_ temp: Float) -> Color {
-        if temp >= 90 { return .red }
-        if temp >= 75 { return .orange }
-        if temp >= 60 { return .yellow }
-        return .primary
     }
 }

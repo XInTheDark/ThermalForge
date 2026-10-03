@@ -130,8 +130,18 @@ public enum DaemonProtocol {
 // MARK: - Request
 
 public struct DaemonRequest: Codable, Equatable {
-    public enum Verb: String, Codable {
+    public enum Verb: String, Codable, CaseIterable {
         case max, auto, set, setfan, status, state, heartbeat, version
+
+        /// Heartbeat, state, and version only touch the daemon's in-memory state.
+        /// They must stay responsive while a fan command holds the SMC lock for a
+        /// multi-second manual-mode acquisition.
+        public var usesSMC: Bool {
+            switch self {
+            case .heartbeat, .state, .version: return false
+            case .max, .auto, .set, .setfan, .status: return true
+            }
+        }
     }
 
     /// Protocol version this client speaks.
@@ -144,8 +154,8 @@ public struct DaemonRequest: Codable, Equatable {
     /// Apply as an unsupervised hold (heartbeat watchdog stays disarmed) — replaces
     /// the old trailing " oneshot" token. Meaningful only for hold verbs.
     public var oneshot: Bool
-    /// Marks an app max command as a thermal safety latch. Older daemons ignore
-    /// this additional field and still apply the max command normally.
+    /// Marks a max command as a thermal safety latch held until an explicit
+    /// `auto`. Sent only by app builds before 0.3; still honored for them.
     public var safetyLock: Bool
     /// Optional safety threshold carried on heartbeat/configuration requests.
     /// Older daemons ignore the additional field.
@@ -188,8 +198,6 @@ public struct DaemonRequest: Codable, Equatable {
         switch command {
         case .setMax:
             self.init(verb: .max, oneshot: os)
-        case .safetyMax:
-            self.init(verb: .max, safetyLock: true)
         case .setRPM(let rpm):
             self.init(verb: .set, rpm: Int(rpm), oneshot: os)
         case .setFan(let index, let rpm):

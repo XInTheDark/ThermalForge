@@ -32,7 +32,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // the process is exiting, so an async write would be dropped; both calls are
         // bounded by the sendRaw timeout.
         let client = DaemonClient()
-        if let state = try? client.readState(), state.owner == "app", !state.safetyLatched {
+        if let state = try? client.readState(), state.owner == "app" {
             _ = try? client.execute(.resetAuto)
         }
         // owner == "cli" → leave the CLI hold alone; owner == "none" → nothing to reset.
@@ -50,11 +50,11 @@ struct ThermalForgeApp: App {
                 .environmentObject(appState)
         } label: {
             MenuBarLabel(
-                state: appState.monitorState,
-                maxTemp: appState.maxTemp,
+                status: MenuBarLabel.Status(appState.snapshot),
+                temperature: appState.menuTemperature,
                 fahrenheit: appState.useFahrenheit,
-                needsDaemonUpdate: appState.daemonVersionMismatch != nil,
-                sensorFault: appState.sensorFaultMessage != nil
+                needsAttention: appState.daemonVersionMismatch != nil || appState.daemonUnreachable
+                    || appState.daemonInstalled == false || appState.commandHealth != .ok
             )
         }
         .menuBarExtraStyle(.window)
@@ -64,44 +64,48 @@ struct ThermalForgeApp: App {
 // MARK: - Menu Bar Label
 
 struct MenuBarLabel: View {
-    let state: MonitorState
-    let maxTemp: Float?
+    enum Status {
+        case appleAuto, controlling, safety
+
+        init(_ snapshot: MonitorSnapshot?) {
+            guard let snapshot else { self = .appleAuto; return }
+            if snapshot.safetyOverride { self = .safety; return }
+            switch snapshot.target {
+            case .rpm?, .perFan?: self = .controlling
+            default: self = .appleAuto
+            }
+        }
+    }
+
+    let status: Status
+    let temperature: Float?
     var fahrenheit: Bool = false
-    var needsDaemonUpdate: Bool = false
-    var sensorFault: Bool = false
+    var needsAttention: Bool = false
 
     var body: some View {
         HStack(spacing: 3) {
             Image(systemName: iconName)
                 .overlay(alignment: .topTrailing) {
-                    // Small dot when the daemon is out of sync — visible without
-                    // opening the menu, for users who never touch the CLI.
-                    if needsDaemonUpdate {
+                    if needsAttention {
                         Circle()
                             .fill(.orange)
                             .frame(width: 5, height: 5)
                             .offset(x: 3, y: -2)
                     }
-                    if sensorFault {
-                        Circle()
-                            .fill(.red)
-                            .frame(width: 5, height: 5)
-                            .offset(x: 3, y: 4)
-                    }
                 }
-            if let tempC = maxTemp {
+            if let tempC = temperature {
                 let display = fahrenheit ? tempC * 9 / 5 + 32 : tempC
-                Text("\(Int(display))°")
+                Text("\(Int(display.rounded()))°")
                     .font(.system(.caption, design: .monospaced))
             }
         }
     }
 
     private var iconName: String {
-        switch state {
-        case .safetyOverride: return "exclamationmark.triangle.fill"
-        case .active: return "fan.fill"
-        case .idle: return "fan"
+        switch status {
+        case .safety: return "exclamationmark.triangle.fill"
+        case .controlling: return "fan.fill"
+        case .appleAuto: return "fan"
         }
     }
 }

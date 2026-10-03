@@ -2,359 +2,147 @@
 //  AppState.swift
 //  ThermalForge
 //
-//  Observable bridge between ThermalMonitor and SwiftUI.
+//  Observable bridge between the control loop and SwiftUI: settings, the
+//  latest monitor snapshot, daemon health, and user actions.
+//
+//  Control never latches off. A failed fan command is retried by the
+//  actuator; lost sensors hand the fans to Apple Auto until readings return;
+//  a stalled loop stops heartbeats so the daemon watchdog returns the fans to
+//  Apple Auto, and control resumes when the loop does.
 //
 
+import AppKit
 import ServiceManagement
 import SwiftUI
 @preconcurrency import ThermalForgeCore
 
 @MainActor
 final class AppState: ObservableObject {
-    @Published var latestStatus: ThermalStatus?
-    @Published var activeProfile: FanProfile = .system
-    @Published var batteryProfileID: String = UserDefaults.standard.string(forKey: "batteryProfile") ?? "default"
-    @Published var adapterProfileID: String = UserDefaults.standard.string(forKey: "adapterProfile") ?? "default"
-    @Published var adapterBoostEnabled: Bool = UserDefaults.standard.object(forKey: "adapterBoostEnabled") as? Bool ?? true {
+    // MARK: Settings (persisted)
+
+    @Published var batteryProfileID: String = AppState.storedProfileID(Keys.batteryProfile)
+    @Published var adapterProfileID: String = AppState.storedProfileID(Keys.adapterProfile)
+    /// Apple Auto selected: ThermalForge leaves the fans to macOS.
+    @Published private(set) var appleAutoSelected: Bool =
+        UserDefaults.standard.string(forKey: Keys.selectedProfile) == FanProfile.system.id
+    @Published var adapterBoostEnabled: Bool = AppState.storedBool(Keys.adapterBoost, default: true) {
+        didSet { UserDefaults.standard.set(adapterBoostEnabled, forKey: Keys.adapterBoost); pushSettings() }
+    }
+    @Published var useFahrenheit: Bool = UserDefaults.standard.bool(forKey: Keys.fahrenheit) {
+        didSet { UserDefaults.standard.set(useFahrenheit, forKey: Keys.fahrenheit) }
+    }
+    @Published var sensorRefreshInterval: Double = AppState.storedDouble(Keys.sensorInterval, default: 1.0, in: 0.5...5.0) {
         didSet {
-            UserDefaults.standard.set(adapterBoostEnabled, forKey: "adapterBoostEnabled")
-            refreshMonitorProfiles()
+            UserDefaults.standard.set(sensorRefreshInterval, forKey: Keys.sensorInterval)
+            monitor?.updateIntervals(sensorRefreshInterval: sensorRefreshInterval, controlLoopInterval: controlLoopInterval)
         }
     }
-    @Published var usingExternalPower = false
-    @Published var monitorState: MonitorState = .idle
-    @Published var maxTemp: Float?
-    @Published var useFahrenheit: Bool = UserDefaults.standard.bool(forKey: "useFahrenheit") {
-        didSet { UserDefaults.standard.set(useFahrenheit, forKey: "useFahrenheit") }
-    }
-    @Published var sensorRefreshInterval: Double = AppState.loadInterval(key: AppState.sensorRefreshIntervalKey, fallback: 1.0) {
+    @Published var controlLoopInterval: Double = AppState.storedDouble(Keys.controlInterval, default: 0.1, in: 0.05...0.5) {
         didSet {
-            UserDefaults.standard.set(sensorRefreshInterval, forKey: Self.sensorRefreshIntervalKey)
-            monitor?.updateIntervals(sensorRefreshInterval: sensorRefreshInterval,
-                                     controlLoopInterval: controlLoopInterval)
+            UserDefaults.standard.set(controlLoopInterval, forKey: Keys.controlInterval)
+            monitor?.updateIntervals(sensorRefreshInterval: sensorRefreshInterval, controlLoopInterval: controlLoopInterval)
         }
     }
-    @Published var controlLoopInterval: Double = AppState.loadInterval(key: AppState.controlLoopIntervalKey, fallback: 0.1) {
+    @Published var smoothingEnabled: Bool = AppState.storedBool(Keys.smoothing, default: true) {
+        didSet { UserDefaults.standard.set(smoothingEnabled, forKey: Keys.smoothing); pushSettings() }
+    }
+    @Published var smoothingAttackSeconds: Double = AppState.storedDouble(
+        Keys.attack, default: TemperatureFilter.defaultAttackSeconds, in: 1...15) {
+        didSet { UserDefaults.standard.set(smoothingAttackSeconds, forKey: Keys.attack); pushSettings() }
+    }
+    @Published var smoothingDecaySeconds: Double = AppState.storedDouble(
+        Keys.decay, default: TemperatureFilter.defaultDecaySeconds, in: 5...60) {
+        didSet { UserDefaults.standard.set(smoothingDecaySeconds, forKey: Keys.decay); pushSettings() }
+    }
+    @Published var safetyLimitTemp: Double = AppState.storedDouble(
+        Keys.safetyLimit, default: Double(FanProfile.safetyTempThreshold),
+        in: Double(FanProfile.safetyLimitRange.lowerBound)...Double(FanProfile.safetyLimitRange.upperBound)) {
         didSet {
-            UserDefaults.standard.set(controlLoopInterval, forKey: Self.controlLoopIntervalKey)
-            monitor?.updateIntervals(sensorRefreshInterval: sensorRefreshInterval,
-                                     controlLoopInterval: controlLoopInterval)
+            UserDefaults.standard.set(safetyLimitTemp, forKey: Keys.safetyLimit)
+            pushSettings()
+            let limit = Float(safetyLimitTemp)
+            let executor = self.executor
+            commandQueue.async { try? executor.execute(.setSafetyLimit(limit)) }
         }
     }
-    @Published var temperatureSmoothingEnabled: Bool = UserDefaults.standard.object(forKey: AppState.temperatureSmoothingKey) as? Bool ?? true {
-        didSet {
-            UserDefaults.standard.set(temperatureSmoothingEnabled, forKey: Self.temperatureSmoothingKey)
-            monitor?.updateTemperatureFilter(enabled: temperatureSmoothingEnabled,
-                                             rampUpWindow: rampUpWindowSeconds,
-                                             rampDownWindow: rampDownWindowSeconds)
-        }
+    /// Hand the fans back to Apple Auto (which can stop them) when cool.
+    @Published var handBackWhenCool: Bool = AppState.storedBool(Keys.handBack, default: true) {
+        didSet { UserDefaults.standard.set(handBackWhenCool, forKey: Keys.handBack); pushSettings() }
     }
-    @Published var rampUpWindowSeconds: Double = UserDefaults.standard.object(forKey: AppState.rampUpWindowSecondsKey) as? Double ?? 10.0 {
-        didSet {
-            UserDefaults.standard.set(rampUpWindowSeconds, forKey: Self.rampUpWindowSecondsKey)
-            monitor?.updateTemperatureFilter(enabled: temperatureSmoothingEnabled,
-                                             rampUpWindow: rampUpWindowSeconds,
-                                             rampDownWindow: rampDownWindowSeconds)
-        }
+    /// Use `customTakeoverTemp` instead of each profile's own takeover temperature.
+    @Published var customTakeoverEnabled: Bool = AppState.storedBool(Keys.customTakeover, default: false) {
+        didSet { UserDefaults.standard.set(customTakeoverEnabled, forKey: Keys.customTakeover); pushSettings() }
     }
-    @Published var rampDownWindowSeconds: Double = UserDefaults.standard.object(forKey: AppState.rampDownWindowSecondsKey) as? Double ?? 30.0 {
-        didSet {
-            UserDefaults.standard.set(rampDownWindowSeconds, forKey: Self.rampDownWindowSecondsKey)
-            monitor?.updateTemperatureFilter(enabled: temperatureSmoothingEnabled,
-                                             rampUpWindow: rampUpWindowSeconds,
-                                             rampDownWindow: rampDownWindowSeconds)
-        }
+    @Published var customTakeoverTemp: Double = AppState.storedDouble(Keys.takeoverTemp, default: 70, in: 50...90) {
+        didSet { UserDefaults.standard.set(customTakeoverTemp, forKey: Keys.takeoverTemp); pushSettings() }
     }
-    @Published var safetyLimitTemp: Double = AppState.loadSafetyLimit() {
-        didSet {
-            let clamped = min(max(safetyLimitTemp, 85.0), 115.0)
-            if clamped != safetyLimitTemp { safetyLimitTemp = clamped; return }
-            UserDefaults.standard.set(clamped, forKey: Self.safetyLimitTempKey)
-            monitor?.updateSafetyLimit(Float(clamped))
-            commandPump.submit(.setSafetyLimit(Float(clamped)))
-        }
-    }
-    @Published var lowTempThreshold: Double = AppState.loadLowTempThreshold() {
-        didSet {
-            let clamped = min(max(lowTempThreshold, 45.0), 85.0)
-            if clamped != lowTempThreshold { lowTempThreshold = clamped; return }
-            UserDefaults.standard.set(clamped, forKey: Self.lowTempThresholdKey)
-            refreshMonitorProfiles()
-        }
-    }
-    @Published var lowTempRegimeEnabled: Bool = UserDefaults.standard.object(forKey: AppState.lowTempRegimeEnabledKey) as? Bool ?? true {
-        didSet {
-            UserDefaults.standard.set(lowTempRegimeEnabled, forKey: Self.lowTempRegimeEnabledKey)
-            refreshMonitorProfiles()
-        }
-    }
-    @Published var smoothedPeakTemp: Float?
-    /// Reflects the current SMAppService login-item status so the menu toggle shows the
-    /// right state. Initialized from that status as the property's DEFAULT (not reassigned
-    /// in init), so `didSet` does NOT fire on launch — reading the state must never
-    /// re-register. `updateLoginItem()` runs only when the user flips the toggle (the
-    /// SwiftUI binding writes this), never on every launch.
+    /// Reflects the SMAppService login-item status. Initialized as the property
+    /// default so `didSet` only runs when the user flips the toggle.
     @Published var launchAtLogin: Bool = (SMAppService.mainApp.status == .enabled) {
         didSet { updateLoginItem() }
     }
-    /// The running daemon's version when it differs from this app's build, else
-    /// nil. Non-nil drives the "update needed" banner and menu bar badge — the
-    /// long-lived daemon keeps running the old binary after a `brew upgrade`
-    /// until `sudo thermalforge install` re-syncs it.
-    @Published var daemonVersionMismatch: String?
-    /// A hold set from the CLI (`sudo thermalforge max`) that the app is
-    /// reflecting rather than fighting. Non-nil suspends the app's automatic
-    /// profile control and drives the "held from Terminal" banner; the user
-    /// takes back over by picking a profile or pressing Default.
-    @Published var externalHold: DaemonHoldState?
-    /// True when the daemon has stopped answering (two consecutive missed
-    /// heartbeats). Drives the "fan control unavailable" banner + Restart button:
-    /// without the daemon the app can't control fans at all, so this must be
-    /// visible, not just logged. Cleared the moment a heartbeat succeeds.
-    @Published var daemonUnreachable: Bool = false
-    /// Set when the monitor loses its required thermal sensors. Control is handed
-    /// back to macOS and remains there until the user explicitly retries a profile.
-    @Published var sensorFaultMessage: String?
-    /// Draft value for the explicit manual fan test control.
-    @Published var manualFanPercent: Double = 50
-    /// Confirmed target, separate from the draft slider and the SMC manual mode
-    /// (automatic profiles also use that hardware mode).
-    @Published private(set) var manualAppliedPercent: Double?
-    @Published private(set) var manualApplyInProgress = false
-    @Published private(set) var resettingFans = false
-    @Published var manualControlError: String?
-    private var manualRequestID: UUID?
-    private var manualAppliedAt: UInt64?
-    /// Whether launchd has the ThermalForge daemon registered. Nil means the
-    /// first background check has not completed yet.
-    @Published var daemonInstalled: Bool?
-    /// A GitHub release newer than this installed build, else nil. Non-nil drives
-    /// the "Update available" banner. Set from a once-daily check and from persisted
-    /// state on launch (so it shows without waiting for a network round-trip); a
-    /// dismissed version is suppressed until a newer one ships.
+
+    // MARK: Runtime state
+
+    @Published private(set) var snapshot: MonitorSnapshot?
+    /// Running daemon version when it differs from this app's build.
+    @Published private(set) var daemonVersionMismatch: String?
+    /// A hold set from the CLI (`sudo thermalforge max`) that the app reflects
+    /// instead of fighting. Picking a profile or Apple Auto takes over.
+    @Published private(set) var externalHold: DaemonHoldState?
+    /// Two consecutive missed heartbeats.
+    @Published private(set) var daemonUnreachable = false
+    /// Nil until the first background check completes.
+    @Published private(set) var daemonInstalled: Bool?
+    @Published private(set) var commandHealth: FanActuator.Health = .ok
+    /// The control loop stopped ticking; the daemon watchdog returns the fans to
+    /// Apple Auto. Cleared as soon as the loop runs again.
+    @Published private(set) var loopStalled = false
+    /// Another fan-control app that is running and will fight ThermalForge.
+    @Published private(set) var competingFanApp: String?
+    /// The manual fan level being held (0…100), or nil when following a profile.
+    @Published private(set) var manualPercent: Double?
+    @Published var manualDraftPercent: Double = 50
     @Published var availableUpdate: AvailableUpdate?
 
     private var monitor: ThermalMonitor?
+    private var actuator: FanActuator?
     private let executor = PrivilegedExecutor()
-    private var heartbeatTimer: DispatchSourceTimer?
-    /// Consecutive failed heartbeats, for debouncing `daemonUnreachable`.
-    private var heartbeatFailures = 0
-
-    var canApplyManualControl: Bool {
-        !manualApplyInProgress && !resettingFans && !daemonUnreachable &&
-        daemonInstalled == true && externalHold == nil && sensorFaultMessage == nil &&
-        monitor?.hasRecentControlTick() == true &&
-        latestStatus?.hasUsableSafetyTemperature == true &&
-        (latestStatus?.safetyPeakTemp ?? .infinity) < Float(safetyLimitTemp) &&
-        latestStatus?.manualFanCommands(forPercent: manualFanPercent) != nil
-    }
-
-    static let sensorRefreshIntervalKey = "sensorRefreshInterval"
-    static let controlLoopIntervalKey = "controlLoopInterval"
-    static let temperatureSmoothingKey = "temperatureSmoothingEnabled"
-    static let rampUpWindowSecondsKey = "rampUpWindowSeconds"
-    static let rampDownWindowSecondsKey = "rampDownWindowSeconds"
-    static let safetyLimitTempKey = "safetyLimitTemperature"
-    static let lowTempThresholdKey = "lowTempThreshold"
-    static let lowTempRegimeEnabledKey = "lowTempRegimeEnabled"
-    static let sensorRefreshOptions: [Double] = [0.5, 1.0, 2.0, 5.0]
-    static let controlLoopOptions: [Double] = [0.05, 0.1, 0.25, 0.5]
-
-    private static func loadInterval(key: String, fallback: Double) -> Double {
-        let value = UserDefaults.standard.object(forKey: key) as? Double ?? fallback
-        if key == sensorRefreshIntervalKey {
-            return min(max(value, 0.5), 5.0)
-        }
-        if key == controlLoopIntervalKey {
-            return min(max(value, 0.05), 1.0)
-        }
-        return value
-    }
-
-    private static func loadSafetyLimit() -> Double {
-        let value = UserDefaults.standard.object(forKey: safetyLimitTempKey) as? Double ?? 105.0
-        guard value.isFinite else { return 105.0 }
-        return min(max(value, 85.0), 115.0)
-    }
-
-    private static func loadLowTempThreshold() -> Double {
-        let value = UserDefaults.standard.object(forKey: lowTempThresholdKey) as? Double ?? 60.0
-        guard value.isFinite else { return 60.0 }
-        return min(max(value, 45.0), 85.0)
-    }
-
-    private func profileForID(_ id: String) -> FanProfile {
-        FanProfile.available.first(where: { $0.id == id }) ?? .default
-    }
-
-    var currentPreviewProfile: FanProfile {
-        let base = usingExternalPower ? profileForID(adapterProfileID) : profileForID(batteryProfileID)
-        return base.withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
-    }
-
-    private func refreshMonitorProfiles() {
-        let bat = profileForID(batteryProfileID).withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
-        let adp = profileForID(adapterProfileID).withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
-        monitor?.updateProfiles(battery: bat,
-                                adapter: adp,
-                                batteryTransform: .identity,
-                                adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity)
-    }
-
-    /// Runs the 5s heartbeat/version/state polls OFF the main thread so a slow
-    /// or hung daemon can never stall the UI run loop (the v0.1.7 freeze).
+    /// Off-main queue for one-off daemon calls (reset, safety limit, takeover).
+    private let commandQueue = DispatchQueue(label: "com.thermalforge.app-commands", qos: .userInitiated)
     private let heartbeatQueue = DispatchQueue(label: "com.thermalforge.heartbeat", qos: .utility)
-    /// Off-main, serial, coalescing pump for all daemon-bound fan writes (launch
-    /// adopt + monitor ramp commands). It owns its own queue, so this @MainActor
-    /// class never runs socket I/O on the main actor — off-main by construction,
-    /// not by relying on lax isolation. The injected executor closure runs on the
-    /// pump's queue; a CLI-hold rejection is reflected back onto externalHold on the
-    /// main actor.
-    private lazy var commandPump: FanCommandPump = {
-        let executor = self.executor   // capture the Sendable executor value (off-main use)
-        return FanCommandPump { [weak self] command in
-            do {
-                try executor.execute(command)
-                return true
-            } catch {
-                if case .setSafetyLimit = command {
-                    TFLogger.shared.error("Safety limit synchronization failed: \(error)")
-                    return false
-                }
-                // Failure is NEVER silent. If a CLI hold owns the fans, this is
-                // expected arbitration — reflect it on the main actor so the monitor
-                // stops trying and the banner appears immediately (don't wait up to
-                // 5s for the poll). Otherwise it's a real failure — log it.
-                if let state = try? DaemonClient().readState(), state.safetyLatched {
-                    TFLogger.shared.error("Fan command blocked by the daemon safety latch: \(command)")
-                    Task { @MainActor in
-                        self?.sensorFaultMessage = "Fans are locked at maximum by thermal safety. Press Default or Apple Auto to reset."
-                        self?.monitor?.restoreSafetyLock()
-                    }
-                } else if let state = try? DaemonClient().readState(), state.isCLIHold {
-                    TFLogger.shared.info("Fan command yielded to CLI hold: \(command)")
-                    Task { @MainActor in self?.externalHold = state }
-                } else {
-                    TFLogger.shared.error("Fan command failed: \(command) — \(error)")
-                    Task { @MainActor in
-                        self?.monitor?.notifyCommandFailure("a fan command could not be applied")
-                    }
-                }
-                return false
-            }
-        }
-    }()
+    private var heartbeatTimer: DispatchSourceTimer?
+    private var heartbeatFailures = 0
+    private var lastSafetyAlert: Date?
+    private var wakeObserver: NSObjectProtocol?
+
+    enum Keys {
+        static let batteryProfile = "batteryProfile"
+        static let adapterProfile = "adapterProfile"
+        static let selectedProfile = "selectedProfile"
+        static let adapterBoost = "adapterBoostEnabled"
+        static let fahrenheit = "useFahrenheit"
+        static let sensorInterval = "sensorRefreshInterval"
+        static let controlInterval = "controlLoopInterval"
+        static let smoothing = "temperatureSmoothingEnabled"
+        static let attack = "smoothingAttackSeconds"
+        static let decay = "smoothingDecaySeconds"
+        static let safetyLimit = "safetyLimitTemperature"
+        static let handBack = "lowTempRegimeEnabled"
+        static let customTakeover = "customTakeoverEnabled"
+        static let takeoverTemp = "customTakeoverTemperature"
+    }
 
     init() {
-        // launchAtLogin is initialized from SMAppService status as its property default
-        // (above), NOT reassigned here — reassigning would fire didSet and re-register on
-        // every launch. Reflecting state is a read; only a user toggle should register.
-
-        // Show a previously-found update immediately, before any network call.
         availableUpdate = Self.storedAvailableUpdate()
-
-        adoptDaemonStateOnLaunch()
-
-        // Clean expired logs
         ThermalLogger.cleanExpired()
-
         startMonitoring()
-        // startHeartbeat() is intentionally NOT called here — it is launched from
-        // adoptDaemonStateOnLaunch()'s @MainActor completion (the ordering gate),
-        // so the first heartbeat poll can never land before adopt has applied the
-        // launch state. The original synchronous adopt gave this ordering for free;
-        // the async version must restore it explicitly.
-    }
-
-    /// Sync to whatever the daemon is actually holding at launch instead of
-    /// blindly resetting (which destroyed a deliberate CLI hold and the daemon's
-    /// record of it). A CLI hold is reflected and left alone; a stale supervised
-    /// hold left by a crashed prior app instance is cleared here — that's the
-    /// crash recovery the old reset provided, without the collateral damage.
-    private func adoptDaemonStateOnLaunch() {
-        let executor = self.executor
-        let configuredSafetyLimit = Float(self.safetyLimitTemp)
-        // Read the daemon's launch state OFF the main thread so an unresponsive
-        // daemon can't stall app launch — the socket read is bounded by the sendRaw
-        // timeout. runAtLaunch puts this on the pump's serial queue AHEAD of any
-        // ramp write, so a stale-hold reset here can never be reordered behind a
-        // monitor command. During the brief pre-adopt window the monitor may still
-        // issue a command; shipped arbitration rejects an app write over a CLI hold
-        // and the pump latches it, so no fan state is corrupted.
-        commandPump.runAtLaunch { [weak self] in
-            let state = try? DaemonClient().readState()
-
-            // Same four-way decision as before, just resolved off-main; any reset
-            // runs here and only the resulting externalHold is applied on main.
-            let safetyLatched = state?.safetyLatched == true
-            let adopted: DaemonHoldState?
-            if safetyLatched {
-                adopted = state?.isCLIHold == true ? state : nil
-                TFLogger.shared.info("App launched — preserving daemon thermal safety latch")
-            } else if let state, state.isCLIHold {
-                // Deliberate CLI hold — reflect it, don't touch it.
-                adopted = state
-                TFLogger.shared.info("App launched — reflecting CLI hold: \(state.command ?? "?")")
-            } else if let state, !state.isEmpty {
-                // Leftover supervised hold from a crashed prior instance — this is
-                // the live app now, so take over by clearing it (the crash
-                // recovery the old blind reset provided).
-                adopted = nil
-                try? executor.execute(.resetAuto)
-                TFLogger.shared.info("App launched — cleared stale app hold")
-            } else if state != nil {
-                adopted = nil
-                TFLogger.shared.info("App launched — no active hold")
-            } else {
-                // State unreadable — a pre-0.1.7 daemon with no `state` verb
-                // (upgrade window) or unreachable. DELIBERATE fallback to the old
-                // conservative reset: without arbitration we can't tell a CLI hold
-                // from a crashed prior instance's stale hold, and leaving fans
-                // possibly stuck is worse than clearing a possible CLI hold.
-                // Bounded to the pre-0.1.7 daemon window, where the version-
-                // mismatch banner already tells the user to re-sync.
-                adopted = nil
-                try? executor.execute(.resetAuto)
-                TFLogger.shared.info("App launched — daemon state unreadable; reset to auto (degraded)")
-            }
-
-            // Configure the daemon before any queued profile command can run.
-            // Older daemons ignore the additional heartbeat field.
-            try? executor.execute(.setSafetyLimit(configuredSafetyLimit))
-
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.externalHold = adopted
-                // Restore the user's last chosen profile, but NEVER over a reflected CLI
-                // hold — that hold is the most recent explicit intent and wins. With no
-                // hold (including the crash-recovery branch above that just cleared a
-                // stale app hold), apply the saved choice, so a crash while Default was
-                // running comes back to Default. Deferred to here so the hold state is known
-                // before any fan command is issued (no pre-adopt commands in the window).
-                if safetyLatched {
-                    self.sensorFaultMessage = "Fans are locked at maximum by thermal safety. Press Default or Apple Auto to reset."
-                    self.monitor?.restoreSafetyLock()
-                } else if adopted == nil {
-                    let restored = self.restoredProfile()
-                    if restored.id == FanProfile.system.id {
-                        self.activeProfile = .system
-                        self.monitor?.setManualControl(true)
-                        self.monitor?.switchProfile(.system)
-                    } else {
-                        self.monitor?.setManualControl(false)
-                        let active = (self.usingExternalPower ? self.profileForID(self.adapterProfileID) : self.profileForID(self.batteryProfileID))
-                            .withLowTempThreshold(enabled: self.lowTempRegimeEnabled, threshold: Float(self.lowTempThreshold))
-                        self.activeProfile = active
-                        self.refreshMonitorProfiles()
-                    }
-                }
-                // Ordering gate: only now that adopt has applied the launch state
-                // do we start the heartbeat. This makes adopt's externalHold write
-                // strictly precede the first poll's write, so a late adopt (e.g. the
-                // timeout path, ~4s) can't clobber a fresher heartbeat value. It
-                // also means an unbounded connect() inside adopt merely delays the
-                // first heartbeat (all off the main thread) — it never stalls launch.
-                self.startHeartbeat()
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                TFLogger.shared.info("Woke from sleep — resynchronizing fan control")
+                self?.monitor?.resync(resetHistory: true)
             }
         }
     }
@@ -363,151 +151,341 @@ final class AppState: ObservableObject {
         heartbeatTimer?.cancel()
     }
 
+    // MARK: - Derived state
+
+    var batteryProfile: FanProfile { FanProfile.selectable(id: batteryProfileID) }
+    var adapterProfile: FanProfile { FanProfile.selectable(id: adapterProfileID) }
+    var usingExternalPower: Bool { snapshot?.externalPower ?? false }
+
+    /// The profile that applies on the current power source (ignoring Apple Auto).
+    var currentProfile: FanProfile { usingExternalPower ? adapterProfile : batteryProfile }
+
+    var controlSettings: ControlSettings {
+        ControlSettings(
+            handBackWhenCool: handBackWhenCool,
+            takeoverTemp: customTakeoverEnabled ? Float(customTakeoverTemp) : nil,
+            safetyLimit: Float(safetyLimitTemp),
+            batteryTransform: .identity,
+            adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity,
+            filter: TemperatureFilter(isEnabled: smoothingEnabled,
+                                      attackSeconds: smoothingAttackSeconds,
+                                      decaySeconds: smoothingDecaySeconds)
+        )
+    }
+
+    /// Temperature shown in the menu bar: the control temperature.
+    var menuTemperature: Float? {
+        guard let snapshot else { return nil }
+        return smoothingEnabled ? snapshot.controlTemp : snapshot.status.nominalPeakTemp
+    }
+
+    var canApplyManual: Bool {
+        daemonInstalled == true && !daemonUnreachable && externalHold == nil
+            && snapshot?.sensorIssue == nil && snapshot?.status.perFanTarget(level: 0.5) != nil
+    }
+
+    // MARK: - Monitoring
+
+    private func startMonitoring() {
+        guard let fanControl = try? FanControl() else {
+            TFLogger.shared.error("Could not open the SMC — fan control unavailable")
+            return
+        }
+
+        let executor = self.executor
+        let actuator = FanActuator { [weak self] target in
+            do {
+                try executor.apply(target)
+            } catch DaemonError.rejected(.heldByCLI, _) {
+                // A Terminal hold owns the fans: reflect it rather than fight it.
+                let state = try? executor.readState()
+                Task { @MainActor in self?.reflectExternalHold(state) }
+                throw DaemonError.rejected(.heldByCLI, "fans are held from Terminal")
+            } catch DaemonError.rejected(.safetyLocked, _) {
+                // A max-fan latch left by a pre-0.3 app build: clear it, then retry.
+                try executor.execute(.resetAuto)
+                try executor.apply(target)
+            }
+        }
+        actuator.onHealthChange = { [weak self] health in
+            Task { @MainActor in self?.commandHealth = health }
+        }
+        actuator.onAttempt = { target, error in
+            if let error { TFLogger.shared.error("Fan command for \(target) failed: \(error)") }
+        }
+
+        let monitor = ThermalMonitor(
+            source: fanControl,
+            actuator: actuator,
+            batteryProfile: batteryProfile,
+            adapterProfile: adapterProfile,
+            appleAuto: appleAutoSelected,
+            settings: controlSettings,
+            sensorRefreshInterval: sensorRefreshInterval,
+            controlLoopInterval: controlLoopInterval
+        )
+        monitor.onSnapshot = { [weak self] snapshot in
+            Task { @MainActor in self?.receive(snapshot) }
+        }
+        // Send nothing until the daemon's current hold is known.
+        monitor.setMode(.paused)
+        monitor.start()
+        self.monitor = monitor
+        self.actuator = actuator
+
+        adoptDaemonStateOnLaunch()
+    }
+
+    private func receive(_ snapshot: MonitorSnapshot) {
+        let wasOverride = self.snapshot?.safetyOverride ?? false
+        self.snapshot = snapshot
+        if snapshot.safetyOverride, !wasOverride {
+            // One alert per episode, at most every ten minutes.
+            if lastSafetyAlert.map({ Date().timeIntervalSince($0) > 600 }) ?? true {
+                lastSafetyAlert = Date()
+                NotificationManager.shared.sendSafetyAlert(sensorTemp: snapshot.status.safetyPeakTemp,
+                                                           limitTemp: Float(safetyLimitTemp))
+            }
+        }
+    }
+
+    private func pushSettings() {
+        monitor?.updateSettings(controlSettings)
+    }
+
+    private func pushProfiles() {
+        monitor?.updateProfiles(battery: batteryProfile, adapter: adapterProfile, appleAuto: appleAutoSelected)
+    }
+
+    /// Sync with whatever the daemon holds at launch. A Terminal hold is
+    /// reflected and left alone; anything else is replaced by the active profile.
+    private func adoptDaemonStateOnLaunch() {
+        let executor = self.executor
+        let limit = Float(safetyLimitTemp)
+        commandQueue.async { [weak self] in
+            let state = try? executor.readState()
+            if state?.safetyLatched == true, state?.isCLIHold != true {
+                // Pre-0.3 builds latched fans at max after a hotspot spike. The new
+                // safety override is self-clearing, so release the latch.
+                try? executor.execute(.resetAuto)
+                TFLogger.shared.info("App launched — released a max-fan safety latch from an older build")
+            }
+            try? executor.execute(.setSafetyLimit(limit))
+            Task { @MainActor in
+                guard let self else { return }
+                if let state, state.isCLIHold {
+                    TFLogger.shared.info("App launched — reflecting Terminal hold: \(state.command ?? "?")")
+                    self.reflectExternalHold(state)
+                } else {
+                    self.monitor?.setMode(.automatic)
+                }
+                self.startHeartbeat()
+            }
+        }
+    }
+
+    private func reflectExternalHold(_ state: DaemonHoldState?) {
+        guard let state, state.isCLIHold else { return }
+        externalHold = state
+        manualPercent = nil
+        monitor?.setMode(.paused)
+    }
+
     // MARK: - Heartbeat
 
     private func startHeartbeat() {
         let client = DaemonClient()
         let monitor = self.monitor
+        let actuator = self.actuator
+        // Used only on heartbeatQueue (serial), as DaemonBinaryCheck requires.
+        let binaryCheck = Self.bundledCLIPath.map { DaemonBinaryCheck(bundledPath: $0) }
         let timer = DispatchSource.makeTimerSource(queue: heartbeatQueue)
-        timer.schedule(deadline: .now() + 5, repeating: 5)
+        timer.schedule(deadline: .now() + 1, repeating: 5)
         timer.setEventHandler { [weak self] in
-            // Runs OFF the main thread. Each socket round-trip is bounded by the
-            // request timeout, so a hung daemon can no longer stall the UI.
-
-            // Heartbeat is NOT advisory: it refreshes the supervised hold's
-            // liveness and the daemon watchdog reverts after 15s of silence. One
-            // immediate retry absorbs a transient blip without waiting a full 5s
-            // for the next tick.
-            let loopHealthy = monitor?.hasRecentControlTick() ?? false
-            if !loopHealthy {
-                monitor?.suspendForEmergency("the control loop stopped responding")
+            // Off the main thread; every socket call is bounded by a timeout.
+            // A heartbeat proves the control loop is alive. When it is not, stay
+            // silent so the daemon watchdog hands the fans to Apple Auto.
+            let loopHealthy = monitor?.hasRecentTick() ?? false
+            let limit = Float(Self.storedDouble(Keys.safetyLimit, default: Double(FanProfile.safetyTempThreshold),
+                                                in: Double(FanProfile.safetyLimitRange.lowerBound)...Double(FanProfile.safetyLimitRange.upperBound)))
+            let heartbeat = DaemonRequest(verb: .heartbeat, safetyLimitTemp: limit)
+            var hbOK = false
+            if loopHealthy {
+                hbOK = (try? client.request(heartbeat))?.ok == true
+                    || (try? client.request(heartbeat))?.ok == true
             }
-            let storedSafetyLimit = UserDefaults.standard.object(forKey: "safetyLimitTemperature") as? Double ?? 105.0
-            let safetyLimit = Float(min(max(storedSafetyLimit.isFinite ? storedSafetyLimit : 105.0, 85.0), 115.0))
-            let heartbeat = DaemonRequest(verb: .heartbeat, safetyLimitTemp: safetyLimit)
-            let firstBeat = loopHealthy && (try? client.request(heartbeat))?.ok == true
-            let hbOK = firstBeat || (loopHealthy && ((try? client.request(heartbeat))?.ok == true))
-            // If the daemon responded over the socket, it is definitely registered and running.
-            // Avoid a costly /bin/launchctl process fork/exec on every 5s heartbeat tick.
-            let registered = hbOK ? true : ThermalForgeDaemon.isRegisteredWithLaunchd
+            let reachable = hbOK || ThermalForgeDaemon.isRunning
+            let registered = reachable ? true : ThermalForgeDaemon.isRegisteredWithLaunchd
 
-            // Advisory: version + state. On failure/timeout DON'T assert — leave
-            // the last known value untouched rather than clearing the banner on a
-            // transient blip. Only a definitive read updates published state. Both
-            // the `version` reply and an `unsupportedVersion` reply carry the
-            // daemon's build; a reply without one is treated as an older build.
-            let didReadVersion: Bool
-            let versionValue: String?
+            var versionValue: String??   // nil = unknown, .some(nil) = matches
             do {
                 let response = try client.request(DaemonRequest(verb: .version))
                 let daemonVersion = response.version ?? "an older build"
-                versionValue = (daemonVersion == ThermalForgeVersion.current) ? nil : daemonVersion
-                didReadVersion = true
+                if daemonVersion != ThermalForgeVersion.current {
+                    versionValue = .some(daemonVersion)
+                } else if binaryCheck?.installedDiffers() == true {
+                    versionValue = .some("a different local build")
+                } else {
+                    versionValue = .some(nil)
+                }
             } catch DaemonError.incompatibleDaemon {
-                // Legacy (pre-Phase-2) daemon in the upgrade window → show the
-                // update-needed banner rather than leaving it stale.
-                versionValue = "an older build"
-                didReadVersion = true
+                versionValue = .some("an older build")
             } catch {
                 versionValue = nil
-                didReadVersion = false
             }
 
-            // Poll the daemon's hold so a CLI hold set out-of-band shows up in the
-            // menu bar and suspends our monitor. Unreadable → leave externalHold
-            // as-is (don't clear a reflected CLI hold on a transient failure).
-            let didReadState: Bool
-            let holdValue: DaemonHoldState?
-            let stateReadStarted = DispatchTime.now().uptimeNanoseconds
-            if let hold = try? client.readState() {
-                holdValue = hold
-                didReadState = true
-            } else {
-                holdValue = nil
-                didReadState = false
+            let hold = try? client.readState()
+            if let hold, hold.safetyLatched, !hold.isCLIHold {
+                // Latch from an older app build (or one reinstalled mid-episode).
+                _ = try? client.execute(.resetAuto)
+                actuator?.invalidate()
+            } else if let hold, hold.isEmpty, let confirmed = actuator?.confirmedTarget, confirmed != .system {
+                // The daemon lost our hold (restart or watchdog): send it again.
+                TFLogger.shared.info("Daemon no longer holds \(confirmed) — resending")
+                monitor?.resync(resetHistory: false)
             }
 
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if didReadVersion { self.daemonVersionMismatch = versionValue }
-                if didReadState {
-                    self.externalHold = holdValue?.isCLIHold == true ? holdValue : nil
-                    if holdValue?.safetyLatched == true {
-                        self.sensorFaultMessage = self.sensorFaultMessage ?? "Fans are locked at maximum by thermal safety. Press Default or Apple Auto to reset."
-                        if self.monitorState != .safetyOverride {
-                            monitor?.restoreSafetyLock()
-                        }
-                    }
-                    if let appliedAt = self.manualAppliedAt,
-                       stateReadStarted >= appliedAt, holdValue?.owner != "app" {
-                        // A confirmed release ends the test. Leave the monitor
-                        // latched off; never resume a profile after this handback.
-                        let reason = "the background service released manual fan control"
-                        self.sensorFaultMessage = reason
-                        self.clearManualControl()
-                        monitor?.suspendForEmergency(reason)
+                self.loopStalled = !loopHealthy
+                self.updateCompetingFanApp()
+                if let versionValue { self.daemonVersionMismatch = versionValue }
+                self.daemonInstalled = registered
+                if let hold {
+                    if hold.isCLIHold {
+                        if self.externalHold != hold { self.reflectExternalHold(hold) }
+                    } else if self.externalHold != nil {
+                        // The Terminal hold ended (e.g. `thermalforge auto`).
+                        self.externalHold = nil
+                        self.monitor?.setMode(self.manualPercent.map { .manual(level: Float($0 / 100)) } ?? .automatic)
                     }
                 }
-                let wasUnreachable = self.daemonUnreachable
-                self.daemonInstalled = registered
-
-                // Daemon reachability — debounced so a single blip doesn't flash the
-                // "fan control unavailable" banner. Two consecutive missed heartbeats
-                // (~10s) is a real outage; any success clears it immediately.
-                if !loopHealthy {
-                    self.sensorFaultMessage = self.sensorFaultMessage ?? "the control loop stopped responding"
-                    self.activeProfile = .system
-                    self.clearManualControl()
-                    self.heartbeatFailures = 0
-                } else if hbOK {
+                if reachable {
                     self.heartbeatFailures = 0
                     self.daemonUnreachable = false
-
-                    // If the daemon was unreachable and has now reconnected, or if the
-                    // daemon unexpectedly lost its hold while our monitor was active (e.g.
-                    // an out-of-band daemon restart), reapply the profile so fans don't stay at auto.
-                    let daemonLostHold = didReadState && self.monitorState != .idle && holdValue?.owner == "none"
-                    if (wasUnreachable || daemonLostHold),
-                       self.externalHold == nil,
-                       self.manualRequestID == nil, !self.resettingFans,
-                       self.activeProfile.id != FanProfile.system.id,
-                       self.sensorFaultMessage == nil {
-                        monitor?.requestReapply()
-                    }
                 } else {
                     self.heartbeatFailures += 1
                     if self.heartbeatFailures >= 2 { self.daemonUnreachable = true }
                 }
             }
 
-            // Ride the heartbeat as a cheap clock, but hit the network at most once a
-            // day. Runs off-main; nothing here touches published state directly.
             self?.maybeCheckForUpdate()
         }
         timer.resume()
         heartbeatTimer = timer
     }
 
+    /// Fan controllers known to write SMC fan targets. Two controllers fight:
+    /// each overwrites the other's target and the fans hunt.
+    private static let competingFanApps: [(bundleID: String, name: String)] = [
+        ("com.tunabellysoftware.tgpro", "TG Pro"),
+        ("com.crystalidea.macsfancontrol", "Macs Fan Control"),
+    ]
+
+    private func updateCompetingFanApp() {
+        let running = NSWorkspace.shared.runningApplications
+        let found = Self.competingFanApps.first { app in
+            running.contains { $0.bundleIdentifier == app.bundleID || $0.localizedName == app.name }
+        }?.name
+        if found != competingFanApp, let found {
+            TFLogger.shared.info("\(found) is running — it also controls the fans")
+        }
+        competingFanApp = found
+    }
+
+    // MARK: - Actions
+
+    func selectBatteryProfile(_ profile: FanProfile) {
+        batteryProfileID = profile.id
+        UserDefaults.standard.set(profile.id, forKey: Keys.batteryProfile)
+        resumeProfiles()
+    }
+
+    func selectAdapterProfile(_ profile: FanProfile) {
+        adapterProfileID = profile.id
+        UserDefaults.standard.set(profile.id, forKey: Keys.adapterProfile)
+        resumeProfiles()
+    }
+
+    /// Use one profile on both power sources.
+    func selectProfile(_ profile: FanProfile) {
+        batteryProfileID = profile.id
+        adapterProfileID = profile.id
+        UserDefaults.standard.set(profile.id, forKey: Keys.batteryProfile)
+        UserDefaults.standard.set(profile.id, forKey: Keys.adapterProfile)
+        resumeProfiles()
+    }
+
+    /// Follow the selected profiles (leaving Apple Auto or a manual hold).
+    func resumeProfiles() {
+        appleAutoSelected = false
+        UserDefaults.standard.set(currentProfile.id, forKey: Keys.selectedProfile)
+        manualPercent = nil
+        pushProfiles()
+        takeOver(mode: .automatic)
+        TFLogger.shared.profile("Profiles: battery \(batteryProfile.name), adapter \(adapterProfile.name)")
+    }
+
+    func selectAppleAuto() {
+        appleAutoSelected = true
+        UserDefaults.standard.set(FanProfile.system.id, forKey: Keys.selectedProfile)
+        manualPercent = nil
+        pushProfiles()
+        takeOver(mode: .automatic)
+        TFLogger.shared.profile("Apple Auto selected")
+    }
+
+    /// Hold every fan at `percent` of its range until the user resumes a profile.
+    /// The hotspot safety override still applies.
+    func applyManual(_ percent: Double) {
+        guard canApplyManual || externalHold != nil else { return }
+        let value = min(max(percent.rounded(), 0), 100)
+        manualPercent = value
+        takeOver(mode: .manual(level: Float(value / 100)))
+        TFLogger.shared.profile("Manual fan level: \(Int(value))%")
+    }
+
+    /// Release a Terminal hold if there is one, then switch the monitor mode.
+    /// The daemon refuses app commands over a Terminal hold, so it is cleared first.
+    private func takeOver(mode: MonitorMode) {
+        guard externalHold != nil else {
+            monitor?.setMode(mode)
+            return
+        }
+        externalHold = nil
+        let executor = self.executor
+        commandQueue.async { [weak self] in
+            try? executor.execute(.resetAuto)
+            Task { @MainActor in self?.monitor?.setMode(mode) }
+        }
+    }
+
+    // MARK: - Profile persistence helpers
+
+    private static func storedProfileID(_ key: String) -> String {
+        FanProfile.selectable(id: UserDefaults.standard.string(forKey: key)).id
+    }
+
+    nonisolated private static func storedDouble(_ key: String, default value: Double, in range: ClosedRange<Double>) -> Double {
+        let stored = UserDefaults.standard.object(forKey: key) as? Double ?? value
+        guard stored.isFinite else { return value }
+        return min(max(stored, range.lowerBound), range.upperBound)
+    }
+
+    private static func storedBool(_ key: String, default value: Bool) -> Bool {
+        UserDefaults.standard.object(forKey: key) as? Bool ?? value
+    }
+
     // MARK: - Update check
 
-    // nonisolated: read from `maybeCheckForUpdate` on the heartbeat queue. Static
-    // members of a @MainActor type are otherwise MainActor-isolated (a Swift 6 error
-    // to touch off-main); these are immutable constants, so isolation buys nothing.
-    //
-    // We persist the NEXT allowed check time, not the last one, so the gate is a plain
-    // `now >= nextCheck` and both the normal and backed-off cases store `now + interval`
-    // — no negative-interval arithmetic to misread as a bug later.
+    // We persist the NEXT allowed check time, so the gate is `now >= nextCheck`.
     nonisolated private static let updateNextCheckKey = "updateNextCheck"
     nonisolated private static let updateLatestVersionKey = "updateLatestVersion"
     nonisolated private static let updateLatestURLKey = "updateLatestURL"
     nonisolated private static let updateDismissedKey = "updateDismissedVersion"
-    /// Normal cadence: next check a day out. A machine asleep/off checks on next wake.
     nonisolated private static let updateCheckInterval: TimeInterval = 24 * 60 * 60
-    /// After a failed check, next check ~1h out instead of a full day.
     nonisolated private static let updateRetryInterval: TimeInterval = 60 * 60
 
-    /// Reconstruct the last-known available update from persisted state (launch path),
-    /// suppressing a version the user dismissed.
     private static func storedAvailableUpdate() -> AvailableUpdate? {
         let d = UserDefaults.standard
         guard let version = d.string(forKey: updateLatestVersionKey),
@@ -519,28 +497,22 @@ final class AppState: ObservableObject {
         )
     }
 
-    /// Fire a check if a day has elapsed. `nonisolated` so it runs on the heartbeat
-    /// queue; only UserDefaults (thread-safe) is touched here, and the result is
-    /// applied back on the main actor.
+    /// Fire a check if a day has elapsed. Runs on the heartbeat queue.
     nonisolated private func maybeCheckForUpdate() {
         let defaults = UserDefaults.standard
         let nextCheck = (defaults.object(forKey: Self.updateNextCheckKey) as? Date) ?? .distantPast
         guard Date() >= nextCheck else { return }
-        // Claim the window up front so the 5s heartbeat can't refire the fetch.
         defaults.set(Date().addingTimeInterval(Self.updateCheckInterval), forKey: Self.updateNextCheckKey)
 
         Task { [weak self] in
             let result = await UpdateChecker.check()
             if case .failed = result {
-                // Transient failure — pull the next check back to ~1h out, not a day.
                 defaults.set(Date().addingTimeInterval(Self.updateRetryInterval), forKey: Self.updateNextCheckKey)
             }
             await self?.applyUpdateCheck(result)
         }
     }
 
-    /// Apply a completed check. `.failed` is silent (prior state untouched). Only a
-    /// definitive result changes what the user sees.
     func applyUpdateCheck(_ result: UpdateCheckResult) {
         let d = UserDefaults.standard
         switch result {
@@ -553,14 +525,12 @@ final class AppState: ObservableObject {
         case .update(let update):
             d.set(update.version, forKey: Self.updateLatestVersionKey)
             d.set(update.url, forKey: Self.updateLatestURLKey)
-            // Honor a dismissal until a still-newer version arrives.
             if update.version != d.string(forKey: Self.updateDismissedKey) {
                 availableUpdate = update
             }
         }
     }
 
-    /// "Later" — hide the banner for this version; it returns when a newer one ships.
     func dismissUpdate() {
         if let version = availableUpdate?.version {
             UserDefaults.standard.set(version, forKey: Self.updateDismissedKey)
@@ -568,326 +538,26 @@ final class AppState: ObservableObject {
         availableUpdate = nil
     }
 
-    // MARK: - Monitoring
-
-    func startMonitoring() {
-        guard let fc = try? FanControl() else { return }
-
-        let savedID = UserDefaults.standard.string(forKey: Self.selectedProfileKey)
-        let isSystem = (savedID == FanProfile.system.id)
-
-        let batteryProf = profileForID(batteryProfileID).withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
-        let adapterProf = profileForID(adapterProfileID).withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
-        let initialProf = isSystem ? .system : (usingExternalPower ? adapterProf : batteryProf)
-
-        let monitor = ThermalMonitor(
-            fanControl: fc,
-            profile: initialProf,
-            batteryProfile: batteryProf,
-            adapterProfile: adapterProf,
-            batteryTransform: .identity,
-            adapterTransform: adapterBoostEnabled ? .adapterDefault : .identity,
-            sensorRefreshInterval: sensorRefreshInterval,
-            controlLoopInterval: controlLoopInterval,
-            temperatureFilter: TemperatureFilter(
-                isEnabled: temperatureSmoothingEnabled,
-                rampUpWindowSeconds: rampUpWindowSeconds,
-                rampDownWindowSeconds: rampDownWindowSeconds
-            ),
-            safetyLimitTemp: Float(safetyLimitTemp)
-        )
-        if isSystem {
-            monitor.setManualControl(true)
-        }
-        self.activeProfile = initialProf
-        monitor.onSafetyLimitBreached = { [weak self] sensorTemp, limitTemp in
-            Task { @MainActor in
-                guard let self else { return }
-                self.sensorFaultMessage = "A sensor reached \(Int(round(sensorTemp)))°C (safety limit: \(Int(round(limitTemp)))°C). Fans are locked at maximum speed."
-                self.monitorState = .safetyOverride
-                self.clearManualControl()
-                NotificationManager.shared.sendSafetyAlert(sensorTemp: sensorTemp, limitTemp: limitTemp)
-            }
-        }
-        monitor.onUpdate = { [weak self] status, profile, state in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.latestStatus = status
-                self.activeProfile = profile
-                self.monitorState = state
-                self.usingExternalPower = monitor.usingExternalPower
-                self.smoothedPeakTemp = monitor.filteredPeakTemp
-
-                // Peak across CPU and GPU core diodes for menu bar display (matching Stats)
-                let rawMax = status.nominalPeakTemp
-
-                if self.temperatureSmoothingEnabled, let smoothed = monitor.filteredPeakTemp {
-                    self.maxTemp = smoothed
-                } else {
-                    self.maxTemp = rawMax
-                }
-            }
-        }
-        monitor.onPowerSourceUpdate = { [weak self] source in
-            Task { @MainActor in
-                self?.usingExternalPower = source == .external
-            }
-        }
-        monitor.onSensorFault = { [weak self] reason in
-            Task { @MainActor in
-                self?.sensorFaultMessage = reason
-                self?.monitorState = .idle
-                self?.activeProfile = .system
-                self?.clearManualControl()
-            }
-        }
-        monitor.onFanCommand = { [weak self] command in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                let isSafetyCommand = command == .safetyMax
-                // Don't fight a CLI hold — the user set it deliberately. Decide on
-                // the main actor where externalHold lives; the monitor resumes
-                // control when they pick a profile or press Default.
-                guard self.externalHold == nil || isSafetyCommand else { return }
-                // A profile tick can already be queued on the main actor when
-                // Apply is clicked. Drop it while testing or releasing control.
-                // The emergency reset must always be allowed through.
-                if self.monitor?.isControlFaultLatched == true {
-                    guard command == .resetAuto || isSafetyCommand else { return }
-                } else if self.manualRequestID != nil || self.resettingFans {
-                    guard isSafetyCommand else { return }
-                }
-                // Hand off to the coalescing pump; the blocking socket write happens
-                // OFF the main thread. During a ramp these fire up to ~10x/sec;
-                // previously each ran a blocking round-trip on the main actor and
-                // starved the run loop (v0.1.7).
-                self.commandPump.submit(command)
-            }
-        }
-        monitor.start()
-        self.monitor = monitor
-    }
-
-    // MARK: - Actions
-
-    /// Invalidate pending manual commands and release any manual or CLI hold
-    /// before an explicit profile selection resumes automatic control.
-    @discardableResult
-    private func seizeControl() -> Bool {
-        let had = externalHold != nil || manualRequestID != nil || monitor?.isSafetyLockedAtMax == true
-        externalHold = nil
-        clearManualControl()
-        return had
-    }
-
-    private func clearManualControl() {
-        manualRequestID = nil
-        manualAppliedPercent = nil
-        manualAppliedAt = nil
-        manualApplyInProgress = false
-        manualControlError = nil
-    }
-
-    func setDefault() {
-        guard !resettingFans else { return }
-        let took = seizeControl()
-        sensorFaultMessage = nil
-        if took { commandPump.submit(.resetAuto) }
-        monitor?.setManualControl(false)
-        batteryProfileID = FanProfile.default.id
-        adapterProfileID = FanProfile.default.id
-        UserDefaults.standard.set(FanProfile.default.id, forKey: "batteryProfile")
-        UserDefaults.standard.set(FanProfile.default.id, forKey: "adapterProfile")
-        activeProfile = FanProfile.default.withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
-        monitor?.clearFaultForUserRetry()
-        persistSelectedProfile(FanProfile.default.id)
-        refreshMonitorProfiles()
-        TFLogger.shared.profile("Default profile activated")
-    }
-
-    func resetAuto() {
-        guard !resettingFans else { return }
-        resettingFans = true
-        seizeControl()
-        monitor?.setManualControl(true)
-        // resetAuto clears any hold (CLI or app) → daemon .none. This is the
-        // no-CLI-knowledge escape from a pinned hold and returns control to macOS.
-        // Send the reset off-main and reflect Apple Auto ONLY once the daemon confirms;
-        // On failure the command pump enters the emergency latch.
-        commandPump.submit(.resetAuto) { [weak self] ok in
-            Task { @MainActor in
-                guard let self else { return }
-                self.resettingFans = false
-                guard ok else {
-                    TFLogger.shared.error("Reset to Apple Auto failed — daemon unreachable; fans NOT reset")
-                    return
-                }
-                self.activeProfile = .system
-                // Apple Auto is a deliberate user click, so it persists system mode — only
-                // here, on the daemon-confirmed success path, never on a failed reset.
-                self.persistSelectedProfile(FanProfile.system.id)
-                self.monitor?.switchProfile(.system)
-                TFLogger.shared.profile("Reset to Apple Auto")
-            }
-        }
-    }
-
-    /// Apply the slider's draft value only after an explicit button click.
-    /// Automatic profile writes are paused after the click, while the monitor's
-    /// sensor health checks and emergency handback continue to run.
-    func applyManualFanPercent(_ percent: Double) {
-        guard canApplyManualControl,
-              let commands = latestStatus?.manualFanCommands(forPercent: percent) else {
-            manualControlError = "Manual control is unavailable. Check the status above."
-            return
-        }
-
-        let target = min(max(percent, 0), 100)
-        let requestID = UUID()
-        manualRequestID = requestID
-        manualApplyInProgress = true
-        manualAppliedAt = nil
-        manualControlError = nil
-        monitor?.setManualControl(true) { [weak self] in
-            Task { @MainActor in
-                self?.applyManualCommands(commands[...], percent: target, requestID: requestID)
-            }
-        }
-    }
-
-    /// Advance only after each fan accepts its target. A fault, Apple Auto, or
-    /// profile selection invalidates the request before another fan can be set.
-    private func applyManualCommands(_ commands: ArraySlice<FanCommand>, percent: Double, requestID: UUID) {
-        guard manualRequestID == requestID,
-              monitor?.isControlFaultLatched == false else { return }
-        guard let command = commands.first else {
-            manualAppliedPercent = percent
-            manualApplyInProgress = false
-            manualAppliedAt = DispatchTime.now().uptimeNanoseconds
-            TFLogger.shared.profile("Manual fan test applied: \(Int(percent))%")
-            return
-        }
-        commandPump.submit(command) { [weak self] ok in
-            Task { @MainActor in
-                guard let self, self.manualRequestID == requestID else { return }
-                guard ok else {
-                    self.clearManualControl()
-                    self.manualControlError = "The manual fan command was not applied. Check the status above."
-                    self.monitor?.suspendForEmergency("a manual fan command could not be applied")
-                    return
-                }
-                self.applyManualCommands(commands.dropFirst(), percent: percent, requestID: requestID)
-            }
-        }
-    }
-
-    func selectProfile(_ profile: FanProfile) {
-        guard !resettingFans else { return }
-        let took = seizeControl()
-        sensorFaultMessage = nil
-        if profile.curve.handsOff || took { commandPump.submit(.resetAuto) }
-        monitor?.setManualControl(false)
-        batteryProfileID = profile.id
-        adapterProfileID = profile.id
-        UserDefaults.standard.set(profile.id, forKey: "batteryProfile")
-        UserDefaults.standard.set(profile.id, forKey: "adapterProfile")
-        activeProfile = profile.withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
-        monitor?.clearFaultForUserRetry()
-        persistSelectedProfile(profile.id)
-        refreshMonitorProfiles()
-        TFLogger.shared.profile("Selected: \(profile.name)")
-    }
-
-    func selectBatteryProfile(_ profile: FanProfile) {
-        guard !resettingFans else { return }
-        if seizeControl() { commandPump.submit(.resetAuto) }
-        sensorFaultMessage = nil
-        monitor?.setManualControl(false)
-        monitor?.clearFaultForUserRetry()
-        batteryProfileID = profile.id
-        UserDefaults.standard.set(profile.id, forKey: "batteryProfile")
-        persistSelectedProfile(profile.id)
-        if !usingExternalPower {
-            activeProfile = profile.withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
-        }
-        refreshMonitorProfiles()
-    }
-
-    func selectAdapterProfile(_ profile: FanProfile) {
-        guard !resettingFans else { return }
-        if seizeControl() { commandPump.submit(.resetAuto) }
-        sensorFaultMessage = nil
-        monitor?.setManualControl(false)
-        monitor?.clearFaultForUserRetry()
-        adapterProfileID = profile.id
-        UserDefaults.standard.set(profile.id, forKey: "adapterProfile")
-        persistSelectedProfile(profile.id)
-        if usingExternalPower {
-            activeProfile = profile.withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
-        }
-        refreshMonitorProfiles()
-    }
-
-    // MARK: - Profile persistence
-
-    /// The user's last explicitly-chosen profile id, so the app reopens to it instead of
-    /// always Default. Written ONLY on a user click (picker, Default) via
-    /// `persistSelectedProfile`, never on the monitor's per-tick echo of `activeProfile`
-    /// or on watchdog / thermal-floor / crash-recovery fan resets.
-    private static let selectedProfileKey = "selectedProfile"
-
-    private func persistSelectedProfile(_ id: String) {
-        UserDefaults.standard.set(id, forKey: Self.selectedProfileKey)
-    }
-
-    /// The profile to restore at launch: the persisted choice resolved against the known
-    /// profiles, or Default when nothing is saved or the id no longer exists.
-    private func restoredProfile() -> FanProfile {
-        let base = FanProfile.selectable(id: UserDefaults.standard.string(forKey: Self.selectedProfileKey))
-        guard base.id != FanProfile.system.id else { return base }
-        return base.withLowTempThreshold(enabled: lowTempRegimeEnabled, threshold: Float(lowTempThreshold))
-    }
-
     // MARK: - Daemon recovery
 
-    /// Force the root daemon to restart via launchd, from the "Restart daemon"
-    /// button on the unreachable banner. Runs OFF the main thread (it blocks on the
-    /// macOS auth dialog). Uses `launchctl kickstart -k` — the standard "restart
-    /// this service" — via an Authorization prompt: macOS shows the password dialog
-    /// and handles the credential; the app never sees it. On success the next
-    /// heartbeat clears `daemonUnreachable`.
+    /// Restart the root daemon via launchd (`launchctl kickstart -k`) behind a
+    /// macOS administrator prompt. Off the main thread.
     func restartDaemon() {
-        let label = ThermalForgeDaemon.label
-        DispatchQueue.global(qos: .userInitiated).async {
-            // Escaped for AppleScript's `do shell script`; the label is a fixed
-            // constant (no user input), so there's nothing untrusted to inject.
-            let script = "do shell script \"/bin/launchctl kickstart -k system/\(label)\" with administrator privileges"
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            p.arguments = ["-e", script]
-            do {
-                try p.run()
-                p.waitUntilExit()
-                if p.terminationStatus == 0 {
-                    TFLogger.shared.info("Restart daemon: launchctl kickstart requested")
-                } else {
-                    // Non-zero includes the user cancelling the auth prompt (-128).
-                    TFLogger.shared.error("Restart daemon failed (osascript exit \(p.terminationStatus))")
-                }
-            } catch {
-                TFLogger.shared.error("Restart daemon failed to launch: \(error)")
-            }
-        }
+        runPrivileged("/bin/launchctl kickstart -k system/\(ThermalForgeDaemon.label)", purpose: "Restart daemon")
     }
 
-    /// Install the bundled CLI as the privileged launchd daemon. Authentication
-    /// is handled by macOS; the app never receives or stores the password.
+    /// Install the bundled CLI as the privileged launchd daemon.
     func installDaemon() {
         guard let cli = daemonCLIPath() else {
             TFLogger.shared.error("Daemon install unavailable — no bundled or installed CLI found")
             return
         }
-        let command = "\(shellQuote(cli)) install"
+        runPrivileged("\(shellQuote(cli)) install", purpose: "Daemon install") { [weak self] in
+            self?.monitor?.resync(resetHistory: false)
+        }
+    }
+
+    private func runPrivileged(_ command: String, purpose: String, onSuccess: (@MainActor () -> Void)? = nil) {
         let escaped = command.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
         let script = "do shell script \"\(escaped)\" with administrator privileges"
@@ -899,23 +569,27 @@ final class AppState: ObservableObject {
                 try p.run()
                 p.waitUntilExit()
                 if p.terminationStatus == 0 {
-                    TFLogger.shared.info("Daemon install requested")
+                    TFLogger.shared.info("\(purpose) succeeded")
+                    if let onSuccess { Task { @MainActor in onSuccess() } }
                 } else {
-                    TFLogger.shared.error("Daemon install failed (osascript exit \(p.terminationStatus))")
+                    // Non-zero includes the user cancelling the prompt (-128).
+                    TFLogger.shared.error("\(purpose) failed (osascript exit \(p.terminationStatus))")
                 }
             } catch {
-                TFLogger.shared.error("Daemon install failed to launch: \(error)")
+                TFLogger.shared.error("\(purpose) failed to launch: \(error)")
             }
         }
     }
 
+    /// The CLI shipped inside the app bundle, if this build includes one.
+    nonisolated static var bundledCLIPath: String? {
+        Bundle.main.url(forResource: "thermalforge", withExtension: nil)?.path
+    }
+
     private func daemonCLIPath() -> String? {
-        let candidates = [
-            Bundle.main.url(forResource: "thermalforge", withExtension: nil)?.path,
-            "/usr/local/bin/thermalforge",
-            "/opt/homebrew/bin/thermalforge",
-        ].compactMap { $0 }
-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+        [Self.bundledCLIPath, "/usr/local/bin/thermalforge", "/opt/homebrew/bin/thermalforge"]
+            .compactMap { $0 }
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
     private func shellQuote(_ value: String) -> String {
@@ -933,7 +607,7 @@ final class AppState: ObservableObject {
             }
         } catch {
             TFLogger.shared.error("Launch at login toggle failed: \(error)")
-            launchAtLogin = !launchAtLogin // revert toggle
+            launchAtLogin = !launchAtLogin
         }
     }
 }
