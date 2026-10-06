@@ -86,6 +86,22 @@ struct MonitorTests {
         #expect(rig.last == .rpm(4000))
     }
 
+    @Test("Ticks at the sensor cadence while Apple Auto has the fans")
+    func idleCadence() {
+        let rig = Rig()
+        rig.monitor.setMode(.automatic)
+        rig.run(seconds: 2)
+        #expect(rig.monitor.currentTickInterval == 1)
+
+        rig.locked { rig.core = 80 }
+        rig.run(seconds: 2)
+        #expect(rig.monitor.currentTickInterval == 0.1)
+
+        rig.monitor.setMode(.paused)
+        rig.run(seconds: 1)
+        #expect(rig.monitor.currentTickInterval == 1)
+    }
+
     @Test("A glitched reading holds the last target instead of dropping to Apple Auto")
     func glitch() {
         let rig = Rig()

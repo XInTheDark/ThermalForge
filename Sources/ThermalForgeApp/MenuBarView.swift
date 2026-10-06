@@ -5,6 +5,7 @@
 //  Menu bar dropdown content.
 //
 
+import AppKit
 import SwiftUI
 import ThermalForgeCore
 
@@ -31,6 +32,7 @@ struct MenuBarView: View {
             footer
         }
         .frame(width: 300)
+        .background(WindowVisibilityReader { appState.setMenuVisible($0) })
     }
 
     private var header: some View {
@@ -600,5 +602,54 @@ private struct UpdateAvailableBanner: View {
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.blue.opacity(0.12))
+    }
+}
+
+// MARK: - Window visibility
+
+/// Reports whether the hosting window is on screen. The menu bar window stays
+/// alive while closed, so SwiftUI's appear/disappear callbacks don't track it.
+private struct WindowVisibilityReader: NSViewRepresentable {
+    let onChange: (Bool) -> Void
+
+    func makeNSView(context: Context) -> ObserverView {
+        ObserverView(onChange: onChange)
+    }
+
+    func updateNSView(_ view: ObserverView, context: Context) {}
+
+    final class ObserverView: NSView {
+        private let onChange: (Bool) -> Void
+        private var observers: [NSObjectProtocol] = []
+
+        init(onChange: @escaping (Bool) -> Void) {
+            self.onChange = onChange
+            super.init(frame: .zero)
+        }
+
+        required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            observers.forEach(NotificationCenter.default.removeObserver)
+            observers = []
+            guard let window else { onChange(false); return }
+            observers = [NSWindow.didChangeOcclusionStateNotification, NSWindow.didBecomeKeyNotification]
+                .map { name in
+                    NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                        MainActor.assumeIsolated { self?.report() }
+                    }
+                }
+            report()
+        }
+
+        private func report() {
+            guard let window else { return }
+            onChange(window.isVisible && window.occlusionState.contains(.visible))
+        }
+
+        deinit {
+            observers.forEach(NotificationCenter.default.removeObserver)
+        }
     }
 }

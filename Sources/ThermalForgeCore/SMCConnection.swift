@@ -76,6 +76,10 @@ struct SMCParamStruct {
 public final class SMCConnection {
 
     private let connection: io_connect_t
+    /// Key data sizes are fixed by the firmware. Caching them halves the IOKit
+    /// calls of every repeated read (sensor snapshots read ~75 keys a second).
+    private var dataSizes: [UInt32: UInt32] = [:]
+    private let dataSizesLock = NSLock()
 
     public init?() {
         var iterator: io_iterator_t = 0
@@ -110,16 +114,23 @@ public final class SMCConnection {
     public func readKey(_ key: String) -> (success: Bool, bytes: [UInt8], size: UInt32) {
         var input = SMCParamStruct()
         var output = SMCParamStruct()
-
-        // Get key info (data size)
         input.key = fourCharCode(key)
-        input.data8 = SMCCommand.readKeyInfo.rawValue
-        guard callSMC(&input, &output) == kIOReturnSuccess else {
-            return (false, [], 0)
-        }
 
-        let dataSize = output.keyInfo.dataSize
-        guard dataSize > 0 else { return (false, [], 0) }
+        // Get key info (data size) unless it is already known
+        let code = input.key
+        let cachedSize = dataSizesLock.withLock { dataSizes[code] }
+        let dataSize: UInt32
+        if let cachedSize {
+            dataSize = cachedSize
+        } else {
+            input.data8 = SMCCommand.readKeyInfo.rawValue
+            guard callSMC(&input, &output) == kIOReturnSuccess else {
+                return (false, [], 0)
+            }
+            dataSize = output.keyInfo.dataSize
+            guard dataSize > 0 else { return (false, [], 0) }
+            dataSizesLock.withLock { dataSizes[code] = dataSize }
+        }
 
         // Read value
         input.keyInfo.dataSize = dataSize

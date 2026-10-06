@@ -9,6 +9,9 @@
 //  - Control tick (100 ms by default): controller step, ramp, actuator poll.
 //  - Sensor snapshot (1 s by default): SMC temperatures, fan state, power
 //    source. Thermal mass changes slowly; the faster tick only smooths ramps.
+//  While nothing drives the fans (Apple Auto, a Terminal hold, lost sensors)
+//  there is no ramp to smooth, so the loop ticks at the sensor cadence, capped
+//  at `idleTickLimit`. Any configuration change wakes it at the control cadence.
 //
 //  Nothing here latches control off. Sensor loss hands the fans to Apple Auto
 //  until readings return; command failures are retried by the actuator.
@@ -49,8 +52,10 @@ public final class ThermalMonitor: @unchecked Sendable {
     private let pressureProvider: @Sendable () -> ThermalPressure
     private let powerProvider: @Sendable () -> PowerSourceState
     private let clock: @Sendable () -> TimeInterval
-    private let queue = DispatchQueue(label: "com.thermalforge.monitor", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "com.thermalforge.monitor", qos: .utility)
     private var timer: DispatchSourceTimer?
+    /// The timer's current period.
+    private var tickInterval: TimeInterval
 
     // Queue-confined state.
     private var controller: FanController
@@ -84,6 +89,11 @@ public final class ThermalMonitor: @unchecked Sendable {
     static let mismatchSeconds: TimeInterval = 4
     static let mismatchToleranceRPM = 150
     static let snapshotInterval: TimeInterval = 0.5
+    /// Longest idle tick. Keeps the app heartbeat's loop-health check fresh.
+    static let idleTickLimit: TimeInterval = 1
+    /// A sensor read due within this margin happens on the current tick, so
+    /// timer jitter cannot push a read to the next (possibly idle) tick.
+    static let sensorReadMargin: TimeInterval = 0.05
 
     /// Called on the monitor queue about twice a second.
     public var onSnapshot: (@Sendable (MonitorSnapshot) -> Void)?
@@ -109,6 +119,7 @@ public final class ThermalMonitor: @unchecked Sendable {
         self.clock = clock
         self.controlInterval = max(controlLoopInterval, 0.05)
         self.sensorInterval = max(sensorRefreshInterval, max(controlLoopInterval, 0.05))
+        self.tickInterval = self.controlInterval
         self.controller = FanController(profile: appleAuto ? .system : batteryProfile, settings: settings)
     }
 
@@ -120,10 +131,10 @@ public final class ThermalMonitor: @unchecked Sendable {
             lastTick = nil
             lastSensorRead = nil
             let timer = DispatchSource.makeTimerSource(queue: queue)
-            timer.schedule(deadline: .now(), repeating: controlInterval, leeway: .milliseconds(10))
             timer.setEventHandler { [weak self] in self?.tick() }
-            timer.resume()
             self.timer = timer
+            wake()
+            timer.resume()
         }
     }
 
@@ -146,12 +157,15 @@ public final class ThermalMonitor: @unchecked Sendable {
             controlInterval = max(controlLoopInterval, 0.05)
             sensorInterval = max(sensorRefreshInterval, controlInterval)
             lastSensorRead = nil
-            timer?.schedule(deadline: .now(), repeating: controlInterval, leeway: .milliseconds(10))
+            wake()
         }
     }
 
     public func updateSettings(_ settings: ControlSettings) {
-        queue.async { [self] in controller.setSettings(settings) }
+        queue.async { [self] in
+            controller.setSettings(settings)
+            wake()
+        }
     }
 
     /// Set the battery and adapter profiles, or Apple Auto.
@@ -161,6 +175,7 @@ public final class ThermalMonitor: @unchecked Sendable {
             adapterProfile = adapter
             self.appleAuto = appleAuto
             applyActiveProfile()
+            wake()
         }
     }
 
@@ -171,6 +186,7 @@ public final class ThermalMonitor: @unchecked Sendable {
             self.mode = mode
             actuator.setPaused(mode == .paused)
             if wasPaused { actuator.invalidate() }
+            wake()
         }
     }
 
@@ -180,8 +196,12 @@ public final class ThermalMonitor: @unchecked Sendable {
             if resetHistory { controller.reset() }
             mismatchSeconds = 0
             actuator.invalidate()
+            wake()
         }
     }
+
+    /// The timer period: the control cadence while driving the fans, longer while idle.
+    var currentTickInterval: TimeInterval { queue.sync { tickInterval } }
 
     /// The app heartbeat uses this to prove the loop is still making progress.
     public func hasRecentTick(within interval: TimeInterval = 3) -> Bool {
@@ -198,9 +218,10 @@ public final class ThermalMonitor: @unchecked Sendable {
         lastTick = now
         healthLock.lock(); lastTickUptime = now; healthLock.unlock()
 
-        if lastSensorRead == nil || now - lastSensorRead! >= sensorInterval {
+        if lastSensorRead == nil || now - lastSensorRead! >= sensorInterval - Self.sensorReadMargin {
             readSensors(now: now)
         }
+        defer { setTickInterval(drivingFans ? controlInterval : idleInterval) }
 
         guard let status, sensorIssue == nil else {
             // No trustworthy readings: Apple Auto has the fans until they return.
@@ -243,6 +264,39 @@ public final class ThermalMonitor: @unchecked Sendable {
         actuator.poll()
         emitSnapshot(now: now)
     }
+
+    // MARK: - Cadence
+
+    /// A fan target other than Apple Auto is being held, so ramps need the control cadence.
+    private var drivingFans: Bool {
+        switch lastTarget {
+        case .rpm?, .perFan?: return true
+        case .system?, nil: return false
+        }
+    }
+
+    private var idleInterval: TimeInterval {
+        max(controlInterval, min(sensorInterval, Self.idleTickLimit))
+    }
+
+    /// Tick right away at the control cadence; that tick settles the cadence again.
+    private func wake() {
+        tickInterval = controlInterval
+        timer?.schedule(deadline: .now(), repeating: controlInterval, leeway: Self.leeway(controlInterval))
+    }
+
+    private func setTickInterval(_ interval: TimeInterval) {
+        guard interval != tickInterval else { return }
+        tickInterval = interval
+        timer?.schedule(deadline: .now() + interval, repeating: interval, leeway: Self.leeway(interval))
+    }
+
+    /// Leeway lets macOS coalesce the wakeups with other work.
+    private static func leeway(_ interval: TimeInterval) -> DispatchTimeInterval {
+        .milliseconds(Int(min(interval / 2, 0.25) * 1000))
+    }
+
+    // MARK: - Sensors
 
     private func readSensors(now: TimeInterval) {
         let elapsed = now - (lastSensorRead ?? now)

@@ -483,7 +483,8 @@ public final class FanControl: ThermalStatusSource {
     }
 
     /// Read the host CPU brand string via sysctl to determine the platform architecture.
-    public static var currentPlatform: Platform {
+    /// Read once: the snapshot properties consult it on every control tick.
+    public static let currentPlatform: Platform = {
         var size = 0
         sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0)
         guard size > 0 else { return .unknown }
@@ -497,7 +498,7 @@ public final class FanControl: ThermalStatusSource {
         if name.contains("m4") { return .m4 }
         if name.contains("m5") { return .m5 }
         return .unknown
-    }
+    }()
 
     /// CPU core diode keys for a specific platform matching Stats (exelban/stats).
     /// Prevents cross-generation sensor collisions (e.g. Tp0f is a P-core on M2, but an 80°C+ hotspot on M4).

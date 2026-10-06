@@ -114,7 +114,7 @@ public final class FanActuator: @unchecked Sendable {
     /// Called on the actuator's queue after each attempt (target, error or nil).
     public var onAttempt: (@Sendable (FanTarget, Error?) -> Void)?
 
-    public init(queue: DispatchQueue = DispatchQueue(label: "com.thermalforge.actuator", qos: .userInitiated),
+    public init(queue: DispatchQueue = DispatchQueue(label: "com.thermalforge.actuator", qos: .utility),
                 now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
                 perform: @escaping Perform) {
         self.queue = queue

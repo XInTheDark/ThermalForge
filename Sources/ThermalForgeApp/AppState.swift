@@ -29,7 +29,7 @@ final class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(adapterBoostEnabled, forKey: Keys.adapterBoost); pushSettings() }
     }
     @Published var useFahrenheit: Bool = UserDefaults.standard.bool(forKey: Keys.fahrenheit) {
-        didSet { UserDefaults.standard.set(useFahrenheit, forKey: Keys.fahrenheit) }
+        didSet { UserDefaults.standard.set(useFahrenheit, forKey: Keys.fahrenheit); refreshMenuLabel() }
     }
     @Published var sensorRefreshInterval: Double = AppState.storedDouble(Keys.sensorInterval, default: 1.0, in: 0.5...5.0) {
         didSet {
@@ -44,7 +44,7 @@ final class AppState: ObservableObject {
         }
     }
     @Published var smoothingEnabled: Bool = AppState.storedBool(Keys.smoothing, default: true) {
-        didSet { UserDefaults.standard.set(smoothingEnabled, forKey: Keys.smoothing); pushSettings() }
+        didSet { UserDefaults.standard.set(smoothingEnabled, forKey: Keys.smoothing); pushSettings(); refreshMenuLabel() }
     }
     @Published var smoothingAttackSeconds: Double = AppState.storedDouble(
         Keys.attack, default: TemperatureFilter.defaultAttackSeconds, in: 1...15) {
@@ -84,7 +84,11 @@ final class AppState: ObservableObject {
 
     // MARK: Runtime state
 
+    /// The snapshot the menu shows. Published only while the menu is open:
+    /// each publish re-renders the whole scene, and nothing shows it otherwise.
     @Published private(set) var snapshot: MonitorSnapshot?
+    /// What the menu bar label shows, published only when it changes.
+    @Published private(set) var menuLabel = MenuBarLabel.Model(status: .appleAuto, degrees: nil)
     /// Running daemon version when it differs from this app's build.
     @Published private(set) var daemonVersionMismatch: String?
     /// A hold set from the CLI (`sudo thermalforge max`) that the app reflects
@@ -105,6 +109,9 @@ final class AppState: ObservableObject {
     @Published var manualDraftPercent: Double = 50
     @Published var availableUpdate: AvailableUpdate?
 
+    /// The newest snapshot, whether or not the menu is open.
+    private var latestSnapshot: MonitorSnapshot?
+    private var menuVisible = false
     private var monitor: ThermalMonitor?
     private var actuator: FanActuator?
     private let executor = PrivilegedExecutor()
@@ -155,7 +162,7 @@ final class AppState: ObservableObject {
 
     var batteryProfile: FanProfile { FanProfile.selectable(id: batteryProfileID) }
     var adapterProfile: FanProfile { FanProfile.selectable(id: adapterProfileID) }
-    var usingExternalPower: Bool { snapshot?.externalPower ?? false }
+    var usingExternalPower: Bool { latestSnapshot?.externalPower ?? false }
 
     /// The profile that applies on the current power source (ignoring Apple Auto).
     var currentProfile: FanProfile { usingExternalPower ? adapterProfile : batteryProfile }
@@ -174,14 +181,15 @@ final class AppState: ObservableObject {
     }
 
     /// Temperature shown in the menu bar: the control temperature.
-    var menuTemperature: Float? {
-        guard let snapshot else { return nil }
-        return smoothingEnabled ? snapshot.controlTemp : snapshot.status.nominalPeakTemp
+    var menuTemperature: Float? { snapshot.map(controlTemperature) }
+
+    private func controlTemperature(_ snapshot: MonitorSnapshot) -> Float {
+        smoothingEnabled ? snapshot.controlTemp : snapshot.status.nominalPeakTemp
     }
 
     var canApplyManual: Bool {
         daemonInstalled == true && !daemonUnreachable && externalHold == nil
-            && snapshot?.sensorIssue == nil && snapshot?.status.perFanTarget(level: 0.5) != nil
+            && latestSnapshot?.sensorIssue == nil && latestSnapshot?.status.perFanTarget(level: 0.5) != nil
     }
 
     // MARK: - Monitoring
@@ -237,8 +245,10 @@ final class AppState: ObservableObject {
     }
 
     private func receive(_ snapshot: MonitorSnapshot) {
-        let wasOverride = self.snapshot?.safetyOverride ?? false
-        self.snapshot = snapshot
+        let wasOverride = latestSnapshot?.safetyOverride ?? false
+        latestSnapshot = snapshot
+        if menuVisible { self.snapshot = snapshot }
+        refreshMenuLabel()
         if snapshot.safetyOverride, !wasOverride {
             // One alert per episode, at most every ten minutes.
             if lastSafetyAlert.map({ Date().timeIntervalSince($0) > 600 }) ?? true {
@@ -247,6 +257,24 @@ final class AppState: ObservableObject {
                                                            limitTemp: Float(safetyLimitTemp))
             }
         }
+    }
+
+    /// The menu window opened or closed.
+    func setMenuVisible(_ visible: Bool) {
+        guard visible != menuVisible else { return }
+        menuVisible = visible
+        if visible { snapshot = latestSnapshot }
+    }
+
+    private func refreshMenuLabel() {
+        let label = MenuBarLabel.Model(
+            status: MenuBarLabel.Status(latestSnapshot),
+            degrees: latestSnapshot.map { snapshot in
+                let celsius = controlTemperature(snapshot)
+                return Int((useFahrenheit ? celsius * 9 / 5 + 32 : celsius).rounded())
+            }
+        )
+        if label != menuLabel { menuLabel = label }
     }
 
     private func pushSettings() {

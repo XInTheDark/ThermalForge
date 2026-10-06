@@ -85,7 +85,7 @@ SSD, memory, ambient, and power-delivery sensors are shown and logged but do not
 
 In **Settings** you can keep control at minimum speed instead of handing back to Apple Auto, or set one custom takeover temperature for every profile.
 
-The control loop runs every 100 ms; a full SMC sensor snapshot is taken every second from keys found at startup. Both are adjustable under **Refresh**.
+The control loop runs every 100 ms while ThermalForge drives the fans, and at the sensor cadence (at most 1 s) while Apple Auto has them; a full SMC sensor snapshot is taken every second from keys found at startup. Both are adjustable under **Refresh**.
 
 To add a profile, define a `FanProfile` and append it to `FanProfile.available`. The controller, pickers, and preview all use that registry.
 

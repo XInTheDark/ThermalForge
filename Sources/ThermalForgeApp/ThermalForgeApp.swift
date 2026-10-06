@@ -50,9 +50,7 @@ struct ThermalForgeApp: App {
                 .environmentObject(appState)
         } label: {
             MenuBarLabel(
-                status: MenuBarLabel.Status(appState.snapshot),
-                temperature: appState.menuTemperature,
-                fahrenheit: appState.useFahrenheit,
+                model: appState.menuLabel,
                 needsAttention: appState.daemonVersionMismatch != nil || appState.daemonUnreachable
                     || appState.daemonInstalled == false || appState.commandHealth != .ok
             )
@@ -64,6 +62,12 @@ struct ThermalForgeApp: App {
 // MARK: - Menu Bar Label
 
 struct MenuBarLabel: View {
+    struct Model: Equatable {
+        var status: Status
+        /// Rounded, in the user's unit.
+        var degrees: Int?
+    }
+
     enum Status {
         case appleAuto, controlling, safety
 
@@ -77,9 +81,7 @@ struct MenuBarLabel: View {
         }
     }
 
-    let status: Status
-    let temperature: Float?
-    var fahrenheit: Bool = false
+    let model: Model
     var needsAttention: Bool = false
 
     var body: some View {
@@ -93,16 +95,15 @@ struct MenuBarLabel: View {
                             .offset(x: 3, y: -2)
                     }
                 }
-            if let tempC = temperature {
-                let display = fahrenheit ? tempC * 9 / 5 + 32 : tempC
-                Text("\(Int(display.rounded()))°")
+            if let degrees = model.degrees {
+                Text("\(degrees)°")
                     .font(.system(.caption, design: .monospaced))
             }
         }
     }
 
     private var iconName: String {
-        switch status {
+        switch model.status {
         case .safety: return "exclamationmark.triangle.fill"
         case .controlling: return "fan.fill"
         case .appleAuto: return "fan"
